@@ -1,7 +1,6 @@
 # Battleship Assistant
 
-A Python tool that tells you where to fire next in Battleship. It runs Monte-Carlo
-simulations of every layout the enemy fleet could still be in, shows the result as a
+A Python tool that tells you where to fire next in Battleship. It samples thousands of possible enemy fleet layouts with Monte Carlo, shows the result as a
 heat map, and recommends the best square, using a checkerboard search while hunting.
 
 **No installs needed.** It uses only the Python standard library (Python 3.9+).
@@ -53,9 +52,10 @@ python server.py --port 9000 --no-browser
     class you have already been shooting and takes the best square in it.
   * Squares where no remaining ship can physically fit (because of misses and sunk
     ships around them) are never suggested.
-* **Consistency checks.** The tool warns you if your hits and misses can't be
-  explained by the remaining fleet, or if the number of sunk squares doesn't match
-  the ships marked sunk.
+* **Consistency checks.** The tool warns you if its sampler cannot find a layout
+  fitting the recorded state, or if SUNK squares do not match sunk ships. It will
+  not recommend an arbitrary shot if no consistent layout was sampled. This does
+  not distinguish a mathematically impossible state from sampling exhaustion.
 
 ## Benchmark (self-play, `engine.play_game`)
 
@@ -67,8 +67,9 @@ python server.py --port 9000 --no-browser
 ## Notes and limits
 
 * Simulations are approximate. Ships are placed one after another rather than drawn
-  perfectly uniformly from all possible layouts. In practice the heat maps match
-  exact counts closely, and more simulations give smoother maps.
+  perfectly uniformly from all possible layouts. Sequential placement can bias the estimated probabilities relative to a
+  uniform distribution over valid complete layouts. More samples reduce random noise,
+  **not this systematic bias**. See `TESTING.md`.
 * The model assumes your opponent places ships at random. Real people favour some
   patterns, such as avoiding edges or not letting ships touch.
 
@@ -77,4 +78,6 @@ python server.py --port 9000 --no-browser
 * `engine.py`: rules, Monte-Carlo simulation, recommender, auto-sink, self-play
 * `server.py`: local web server and JSON API (`/api/analyze`, `/api/sink`)
 * `dashboard.html`: the interactive dashboard
-* `test_engine.py`: unit tests (`python -m unittest test_engine.py`)
+* `test_engine.py`: original unit tests (`python -m unittest test_engine.py`)
+* `tests/`: expanded pytest suite (`python -m pytest -rx -q`)
+* `TESTING.md`: regression coverage and outstanding probability-calibration issue

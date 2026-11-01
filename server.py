@@ -20,13 +20,35 @@ HERE = Path(__file__).resolve().parent
 
 
 def board_from(payload) -> engine.Board:
-    size = int(payload.get("size", 10))
-    grid = [int(x) for x in payload.get("grid", [])] or [0] * size * size
+    size = payload.get("size", 10)
+    if type(size) is not int or not 1 <= size <= 26:
+        raise ValueError("Board size must be an integer from 1 to 26")
+    raw_grid = payload.get("grid", [])
+    if not isinstance(raw_grid, list):
+        raise ValueError("grid must be a list of square states")
+    grid = [0] * (size * size) if not raw_grid else raw_grid
     if len(grid) != size * size:
         raise ValueError("grid length does not match size")
-    fleet = [(str(n), int(L)) for n, L in payload.get("fleet", engine.DEFAULT_FLEET)]
+    if any(type(state) is not int or state not in engine.STATE_NAMES for state in grid):
+        raise ValueError("grid contains an unknown square state")
+    raw_fleet = payload.get("fleet", engine.DEFAULT_FLEET)
+    if not isinstance(raw_fleet, (list, tuple)):
+        raise ValueError("fleet must be a list of [name, length] pairs")
+    fleet = []
+    for pair in raw_fleet:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError("Each fleet entry must be [name, length]")
+        name, length = pair
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Ship names must be nonempty strings")
+        if type(length) is not int or not 1 <= length <= size:
+            raise ValueError("Ship lengths must be between 1 and board size")
+        fleet.append((name, length))
+    sunk = payload.get("sunk", [])
+    if not isinstance(sunk, list) or any(not isinstance(name, str) for name in sunk):
+        raise ValueError("sunk must be a list of ship names")
     return engine.Board(size=size, grid=grid, fleet=fleet,
-                        sunk_ships=list(payload.get("sunk", [])),
+                        sunk_ships=sunk,
                         no_touch=bool(payload.get("no_touch", False)))
 
 
@@ -37,8 +59,9 @@ def analyze(payload):
     rec = engine.recommend(board, sim, use_parity=bool(payload.get("parity", True)))
     warnings = board.warnings()
     if not sim.consistent and board.remaining_ships():
-        warnings.insert(0, "No ship layout fits your hits/misses with the remaining ships. "
-                           "Check for a mis-entered square or a ship marked sunk by mistake.")
+        warnings.insert(0, "No consistent layout was found by the sampler. "
+                           "Check the board or rerun with more samples; very constrained "
+                           "boards may require additional search.")
     return {
         "probs": sim.probs,
         "fits": sim.fit_counts,

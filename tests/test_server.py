@@ -1,95 +1,135 @@
-"""Deterministic rules, coordinate, fleet and placement invariants."""
+"""JSON boundary and lightweight real HTTP integration tests (stdlib only)."""
+
+import json
+import threading
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import pytest
 
 import engine as e
+import server
 
 
-def test_classic_rules_and_fleet():
-    assert sum(length for _, length in e.DEFAULT_FLEET) == 17
-    assert sorted(length for _, length in e.DEFAULT_FLEET) == [2, 3, 3, 4, 5]
-    assert e.Board().size == 10
-    assert len(e.Board().grid) == 100
+def test_board_from_payload_round_trip():
+    payload = {'size': 4, 'grid': [0] * 16, 'fleet': [['A', 2]],
+               'sunk': [], 'no_touch': True}
+    payload['grid'][3] = e.MISS
+    b = server.board_from(payload)
+    assert b.size == 4 and b.no_touch
+    assert b.get(0, 3) == e.MISS
+    assert b.remaining_ships() == [('A', 2)]
 
 
-@pytest.mark.parametrize('text,expected', [('a1', (0, 0)), (' B7 ', (1, 6)), ('J10', (9, 9))])
-def test_coordinate_round_trip(text, expected):
-    assert e.parse_coord(text) == expected
-    assert e.parse_coord(e.coord_name(*expected)) == expected
+def test_analyze_json_schema_and_probabilities():
+    payload = {'size': 4, 'fleet': [['Patrol', 2]], 'samples': 250,
+               'grid': [e.MISS] * 16, 'parity': True}
+    payload['grid'][5] = e.HIT
+    payload['grid'][6] = e.UNKNOWN
+    response = server.analyze(payload)
+    assert response['consistent']
+    assert len(response['probs']) == len(response['fits']) == 16
+    assert response['samples'] == 250
+    assert response['remaining'] == [('Patrol', 2)]
+    assert response['rec']['best_name'] == 'B3'
+    assert response['probs'][6] == 1.0
+    assert response['probs'][5] == 0.0
 
 
-@pytest.mark.parametrize('text', ['A0', 'A11', 'K1', 'B', '', 'AA1', '3C', 'A-1', 'B1.5'])
-def test_invalid_coordinates(text):
+def test_analyze_clamps_sample_count():
+    response = server.analyze({'size': 3, 'fleet': [['A', 1]], 'samples': 1})
+    assert response['samples'] == 200
+
+
+def test_sink_json_endpoint_converts_hit_line():
+    grid = [0] * 16
+    grid[5] = grid[6] = e.HIT
+    response = server.sink({'size': 4, 'grid': grid, 'fleet': [['Patrol', 2]],
+                            'sunk': [], 'ship': 'Patrol', 'last': 6})
+    assert response['converted'] == [5, 6]
+    assert response['grid'][5] == response['grid'][6] == e.SUNK
+    assert response['sunk'] == ['Patrol']
+
+
+def test_invalid_grid_length_rejected():
+    with pytest.raises(ValueError, match='grid length'):
+        server.board_from({'size': 4, 'grid': [0] * 15})
+
+
+@pytest.fixture
+def http_server():
+    httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{httpd.server_port}'
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+def post_json(url, payload):
+    request = Request(url, data=json.dumps(payload).encode('utf-8'),
+                      headers={'Content-Type': 'application/json'}, method='POST')
+    with urlopen(request, timeout=8) as response:
+        return response.status, json.load(response)
+
+
+def test_http_dashboard_serves_html_and_no_cache(http_server):
+    with urlopen(http_server + '/', timeout=8) as response:
+        html = response.read().decode('utf-8')
+        assert response.status == 200
+        assert response.headers['Cache-Control'] == 'no-store'
+        assert 'text/html' in response.headers['Content-Type']
+        assert '/api/analyze' in html and '/api/sink' in html
+
+
+def test_http_analyze_and_sink_round_trip(http_server):
+    payload = {'size': 4, 'fleet': [['Patrol', 2]], 'samples': 200,
+               'grid': [e.MISS] * 16}
+    payload['grid'][5] = e.HIT
+    payload['grid'][6] = e.UNKNOWN
+    status, data = post_json(http_server + '/api/analyze', payload)
+    assert status == 200 and data['rec']['best_name'] == 'B3'
+    payload['grid'][6] = e.HIT
+    payload.update(ship='Patrol', last=6)
+    status, data = post_json(http_server + '/api/sink', payload)
+    assert status == 200 and data['converted'] == [5, 6]
+
+
+def test_http_returns_400_for_bad_payload_and_404_for_unknown_route(http_server):
+    with pytest.raises(HTTPError) as exc:
+        post_json(http_server + '/api/analyze', {'size': 4, 'grid': [0]})
+    assert exc.value.code == 400
+    assert 'error' in json.load(exc.value)
+    with pytest.raises(HTTPError) as exc:
+        post_json(http_server + '/api/unknown', {})
+    assert exc.value.code == 404
+
+
+def test_api_rejects_unknown_grid_state_numbers():
+    grid = [0] * 16
+    grid[0] = 42
     with pytest.raises(ValueError):
-        e.parse_coord(text)
+        server.board_from({'size': 4, 'grid': grid})
 
 
-@pytest.mark.parametrize('size,length', [(3, 1), (3, 2), (3, 3), (4, 2), (10, 3), (10, 5)])
-def test_placement_count_geometry_and_index(size, length):
-    placements, by_cell = e.placements_for(length, size)
-    expected = size * size if length == 1 else 2 * size * (size - length + 1)
-    assert len(placements) == expected
-    assert len({p.mask for p in placements}) == expected
-    assert len(by_cell) == size * size
-    for p in placements:
-        assert len(p.cells) == length
-        assert len(set(p.cells)) == length
-        assert p.mask.bit_count() == length
-        assert p.mask & p.halo == p.mask
-        assert all(0 <= index < size * size for index in p.cells)
-        rows = {divmod(index, size)[0] for index in p.cells}
-        cols = {divmod(index, size)[1] for index in p.cells}
-        assert len(rows) == 1 or len(cols) == 1  # no diagonal ships
-        if len(rows) == 1:
-            assert max(cols) - min(cols) + 1 == length
-        else:
-            assert max(rows) - min(rows) + 1 == length
-        for index in p.cells:
-            assert p in by_cell[index]
-    for index, group in enumerate(by_cell):
-        assert all(index in p.cells for p in group)
-
-
-def test_halo_excludes_board_wrap_and_includes_diagonals():
-    corner = e._neighbour_mask(0, 4)
-    assert {i for i in range(16) if corner >> i & 1} == {0, 1, 4, 5}
-    center = e._neighbour_mask(5, 4)
-    assert {i for i in range(16) if center >> i & 1} == {
-        0, 1, 2, 4, 5, 6, 8, 9, 10
-    }
-
-
-def test_sunk_ship_removal_preserves_remaining_duplicates():
-    b = e.Board(fleet=[('Patrol', 2), ('Patrol', 2), ('Cruiser', 3)],
-                sunk_ships=['Patrol'])
-    assert b.remaining_ships() == [('Patrol', 2), ('Cruiser', 3)]
-
-
-def test_warnings_check_sunk_count_and_hit_capacity():
-    b = e.Board(size=4, fleet=[('A', 2)], sunk_ships=['A'])
-    assert any('SUNK' in warning for warning in b.warnings())
-    b = e.Board(size=4, fleet=[('A', 2)])
-    for idx in [0, 1, 2]:
-        b.grid[idx] = e.HIT
-    assert any('More open hits' in warning for warning in b.warnings())
-
-
-@pytest.mark.xfail(strict=True, reason='placement input validation missing: length zero creates empty ships')
-@pytest.mark.parametrize('length', [0, -1])
-def test_nonpositive_ship_lengths_rejected(length):
+def test_api_rejects_nonpositive_ship_length():
     with pytest.raises(ValueError):
-        e.placements_for(length, 4)
+        server.board_from({'size': 4, 'fleet': [['Broken', 0]]})
 
 
-@pytest.mark.xfail(strict=True, reason='board set accepts negative indices via Python list indexing')
-def test_board_rejects_negative_coordinates():
-    board = e.Board(size=4)
-    with pytest.raises((ValueError, IndexError)):
-        board.set(-1, 0, e.HIT)
-
-
-@pytest.mark.xfail(strict=True, reason='Board.set() silently wraps an out-of-range column into the next row')
-def test_board_rejects_out_of_range_column():
-    board = e.Board(size=4)
-    with pytest.raises((ValueError, IndexError)):
-        board.set(0, 4, e.MISS)
+def test_http_rejects_out_of_range_ship_and_unknown_grid_state(http_server):
+    bad_grid = [0] * 16
+    bad_grid[2] = 99
+    for payload in (
+        {'size': 4, 'fleet': [['Patrol', 0]]},
+        {'size': 4, 'grid': bad_grid, 'fleet': [['Patrol', 2]]},
+    ):
+        with pytest.raises(HTTPError) as error:
+            post_json(http_server + '/api/analyze', payload)
+        assert error.value.code == 400
+        assert 'error' in json.load(error.value)

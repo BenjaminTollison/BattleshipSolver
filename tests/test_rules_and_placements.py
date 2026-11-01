@@ -1,111 +1,92 @@
-"""Recommendation ordering, hunt/target policy, and ship-sink lifecycle."""
+"""Deterministic rules, coordinate, fleet and placement invariants."""
 
 import pytest
+
 import engine as e
 
 
-def test_hunt_respects_checkerboard_and_unfired_cells():
-    b = e.Board(size=6, fleet=[('A', 3), ('B', 2)])
-    b.set(2, 2, e.MISS)
-    sim = e.simulate(b, 750, seed=4)
-    rec = e.recommend(b, sim)
-    assert rec['mode'] == 'hunt'
-    assert rec['parity']['modulus'] == 2
-    assert rec['best'] is not None and b.grid[rec['best']] == e.UNKNOWN
-    assert all((sum(divmod(x['idx'], b.size)) % 2) == rec['parity']['cls']
-               for x in rec['ranked'])
-    assert [x['p'] for x in rec['ranked']] == sorted(
-        [x['p'] for x in rec['ranked']], reverse=True)
+def test_classic_rules_and_fleet():
+    assert sum(length for _, length in e.DEFAULT_FLEET) == 17
+    assert sorted(length for _, length in e.DEFAULT_FLEET) == [2, 3, 3, 4, 5]
+    assert e.Board().size == 10
+    assert len(e.Board().grid) == 100
 
 
-def test_disabled_parity_and_one_cell_ship_allow_unrestricted_hunt():
-    b = e.Board(size=4, fleet=[('Tiny', 1)])
-    sim = e.simulate(b, 200, seed=6)
-    assert e.recommend(b, sim)['parity'] is None
-    b = e.Board(size=4, fleet=[('A', 2)])
-    sim = e.simulate(b, 200, seed=6)
-    assert e.recommend(b, sim, use_parity=False)['parity'] is None
+@pytest.mark.parametrize('text,expected', [('a1', (0, 0)), (' B7 ', (1, 6)), ('J10', (9, 9))])
+def test_coordinate_round_trip(text, expected):
+    assert e.parse_coord(text) == expected
+    assert e.parse_coord(e.coord_name(*expected)) == expected
 
 
-def test_target_mode_overrides_parity_and_never_refires():
-    b = e.Board(size=4, fleet=[('A', 2)])
-    b.set(1, 1, e.HIT)
-    b.set(2, 1, e.MISS)
-    sim = e.simulate(b, 1000, seed=2)
-    rec = e.recommend(b, sim, use_parity=True)
-    assert rec['mode'] == 'target'
-    assert rec['parity'] is None
-    assert rec['best'] not in (5, 9)
-    assert all(b.grid[item['idx']] == e.UNKNOWN for item in rec['ranked'])
-
-
-def test_ranking_returns_requested_count_and_valid_labels():
-    b = e.Board(size=4, fleet=[('Patrol', 2)])
-    sim = e.simulate(b, 300, seed=1)
-    rec = e.recommend(b, sim, use_parity=False, top_n=3)
-    assert len(rec['ranked']) == 3
-    assert rec['ranked'][0]['idx'] == rec['best']
-    assert rec['ranked'][0]['name'] == rec['best_name']
-    assert all(e.parse_coord(item['name'], size=4) == divmod(item['idx'], 4)
-               for item in rec['ranked'])
-
-
-def test_auto_sink_converts_only_unambiguous_hit_line():
-    b = e.Board(size=5, fleet=[('Cruiser', 3), ('Patrol', 2)])
-    for c in (1, 2, 3):
-        b.set(2, c, e.HIT)
-    assert e.auto_sink(b, 'Cruiser', last_idx=13) == [11, 12, 13]
-    assert all(b.grid[i] == e.SUNK for i in [11, 12, 13])
-    assert b.remaining_ships() == [('Patrol', 2)]
-
-
-def test_auto_sink_ambiguous_hit_shape_does_not_convert():
-    b = e.Board(size=5, fleet=[('Cruiser', 3), ('Patrol', 2)])
-    for r, c in [(2, 1), (2, 2), (2, 3), (1, 2)]:
-        b.set(r, c, e.HIT)
-    assert e.auto_sink(b, 'Cruiser', last_idx=12) == []
-    assert b.grid.count(e.HIT) == 4
-    assert 'Cruiser' in b.sunk_ships
-    assert b.warnings()  # UI should explain why manual SUNK marking is needed
-
-
-def test_auto_sink_unknown_name_rejected_without_mutating_board():
-    b = e.Board()
+@pytest.mark.parametrize('text', ['A0', 'A11', 'K1', 'B', '', 'AA1', '3C', 'A-1', 'B1.5'])
+def test_invalid_coordinates(text):
     with pytest.raises(ValueError):
-        e.auto_sink(b, 'Not in fleet', last_idx=None)
-    assert not b.sunk_ships
+        e.parse_coord(text)
 
 
-@pytest.mark.xfail(strict=True, reason='recommend() falls back to arbitrary zero-probability squares on impossible boards')
-def test_impossible_state_never_has_fabricated_best_shot():
-    b = e.Board(size=4, fleet=[('Patrol', 2)])
-    b.set(0, 0, e.HIT)
-    b.set(3, 3, e.HIT)
-    sim = e.simulate(b, 30, seed=0)
-    assert not sim.consistent
-    rec = e.recommend(b, sim)
-    assert rec['best'] is None
+@pytest.mark.parametrize('size,length', [(3, 1), (3, 2), (3, 3), (4, 2), (10, 3), (10, 5)])
+def test_placement_count_geometry_and_index(size, length):
+    placements, by_cell = e.placements_for(length, size)
+    expected = size * size if length == 1 else 2 * size * (size - length + 1)
+    assert len(placements) == expected
+    assert len({p.mask for p in placements}) == expected
+    assert len(by_cell) == size * size
+    for p in placements:
+        assert len(p.cells) == length
+        assert len(set(p.cells)) == length
+        assert p.mask.bit_count() == length
+        assert p.mask & p.halo == p.mask
+        assert all(0 <= index < size * size for index in p.cells)
+        rows = {divmod(index, size)[0] for index in p.cells}
+        cols = {divmod(index, size)[1] for index in p.cells}
+        assert len(rows) == 1 or len(cols) == 1  # no diagonal ships
+        if len(rows) == 1:
+            assert max(cols) - min(cols) + 1 == length
+        else:
+            assert max(rows) - min(rows) + 1 == length
+        for index in p.cells:
+            assert p in by_cell[index]
+    for index, group in enumerate(by_cell):
+        assert all(index in p.cells for p in group)
 
 
-@pytest.mark.xfail(strict=True, reason='auto_sink() allows sinking the same ship repeatedly')
-def test_duplicate_ship_sink_rejected():
-    b = e.Board(size=4, fleet=[('Patrol', 2)])
-    e.auto_sink(b, 'Patrol', last_idx=None)
+def test_halo_excludes_board_wrap_and_includes_diagonals():
+    corner = e._neighbour_mask(0, 4)
+    assert {i for i in range(16) if corner >> i & 1} == {0, 1, 4, 5}
+    center = e._neighbour_mask(5, 4)
+    assert {i for i in range(16) if center >> i & 1} == {
+        0, 1, 2, 4, 5, 6, 8, 9, 10
+    }
+
+
+def test_sunk_ship_removal_preserves_remaining_duplicates():
+    b = e.Board(fleet=[('Patrol', 2), ('Patrol', 2), ('Cruiser', 3)],
+                sunk_ships=['Patrol'])
+    assert b.remaining_ships() == [('Patrol', 2), ('Cruiser', 3)]
+
+
+def test_warnings_check_sunk_count_and_hit_capacity():
+    b = e.Board(size=4, fleet=[('A', 2)], sunk_ships=['A'])
+    assert any('SUNK' in warning for warning in b.warnings())
+    b = e.Board(size=4, fleet=[('A', 2)])
+    for idx in [0, 1, 2]:
+        b.grid[idx] = e.HIT
+    assert any('More open hits' in warning for warning in b.warnings())
+
+
+@pytest.mark.parametrize('length', [0, -1])
+def test_nonpositive_ship_lengths_rejected(length):
     with pytest.raises(ValueError):
-        e.auto_sink(b, 'Patrol', last_idx=None)
-    assert b.sunk_ships == ['Patrol']
+        e.placements_for(length, 4)
 
 
-def test_best_shot_maximizes_probability_within_eligible_parity_class():
-    b = e.Board(size=6, fleet=[('A', 3), ('B', 2)])
-    b.set(0, 0, e.MISS)
-    b.set(5, 5, e.MISS)
-    sim = e.simulate(b, 2000, seed=26)
-    rec = e.recommend(b, sim)
-    cls = rec['parity']['cls']
-    modulus = rec['parity']['modulus']
-    valid_probs = [sim.probs[i] for i, state in enumerate(b.grid)
-                   if state == e.UNKNOWN and (sum(divmod(i, b.size)) % modulus) == cls
-                   and sim.probs[i] > 0]
-    assert valid_probs
-    assert sim.probs[rec['best']] == max(valid_probs)
+def test_board_rejects_negative_coordinates():
+    board = e.Board(size=4, fleet=[('Patrol', 2)])
+    with pytest.raises((ValueError, IndexError)):
+        board.set(-1, 0, e.HIT)
+
+
+def test_board_rejects_out_of_range_column():
+    board = e.Board(size=4, fleet=[('Patrol', 2)])
+    with pytest.raises((ValueError, IndexError)):
+        board.set(0, 4, e.MISS)

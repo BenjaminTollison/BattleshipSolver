@@ -1,124 +1,149 @@
-"""JSON boundary and lightweight real HTTP integration tests (stdlib only)."""
+"""Monte Carlo correctness, conservation, forced layouts, and independent oracle."""
 
-import json
-import threading
-from http.server import ThreadingHTTPServer
-from pathlib import Path
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from itertools import product
 
 import pytest
 
 import engine as e
-import server
 
 
-def test_board_from_payload_round_trip():
-    payload = {'size': 4, 'grid': [0] * 16, 'fleet': [['A', 2]],
-               'sunk': [], 'no_touch': True}
-    payload['grid'][3] = e.MISS
-    b = server.board_from(payload)
-    assert b.size == 4 and b.no_touch
-    assert b.get(0, 3) == e.MISS
-    assert b.remaining_ships() == [('A', 2)]
+def small_board(size=4, fleet=(('Patrol', 2),), known=(), no_touch=False):
+    board = e.Board(size=size, fleet=list(fleet), no_touch=no_touch)
+    for r, c, state in known:
+        board.set(r, c, state)
+    return board
 
 
-def test_analyze_json_schema_and_probabilities():
-    payload = {'size': 4, 'fleet': [['Patrol', 2]], 'samples': 250,
-               'grid': [e.MISS] * 16, 'parity': True}
-    payload['grid'][5] = e.HIT
-    payload['grid'][6] = e.UNKNOWN
-    response = server.analyze(payload)
-    assert response['consistent']
-    assert len(response['probs']) == len(response['fits']) == 16
-    assert response['samples'] == 250
-    assert response['remaining'] == [('Patrol', 2)]
-    assert response['rec']['best_name'] == 'B3'
-    assert response['probs'][6] == 1.0
-    assert response['probs'][5] == 0.0
+def exact_probabilities(board):
+    """Independent complete-layout oracle for tiny boards (not production sampler)."""
+    lengths = [length for _, length in board.remaining_ships()]
+    blocked = board.mask_of(e.MISS) | board.mask_of(e.SUNK)
+    hits = board.mask_of(e.HIT)
+    if board.no_touch:
+        for i in range(board.size ** 2):
+            if board.grid[i] == e.SUNK:
+                blocked |= e._neighbour_mask(i, board.size)
+    layouts = []
+    choices = [e.placements_for(length, board.size)[0] for length in lengths]
+    for selections in product(*choices):
+        combined = 0
+        forbids = blocked
+        for placement in selections:
+            if placement.mask & forbids:
+                break
+            combined |= placement.mask
+            forbids |= placement.halo if board.no_touch else placement.mask
+        else:
+            if combined & hits == hits:
+                layouts.append(combined)
+    if not layouts:
+        return [0.0] * board.size**2, 0
+    probabilities = [sum(mask >> i & 1 for mask in layouts) / len(layouts)
+                     for i in range(board.size**2)]
+    for i, state in enumerate(board.grid):
+        if state != e.UNKNOWN:
+            probabilities[i] = 0.0
+    return probabilities, len(layouts)
 
 
-def test_analyze_clamps_sample_count():
-    response = server.analyze({'size': 3, 'fleet': [['A', 1]], 'samples': 1})
-    assert response['samples'] == 200
+@pytest.mark.parametrize('seed', [0, 12, 99])
+def test_simulation_deterministic_and_conserves_ship_occupancy(seed):
+    b = small_board(4, fleet=(('A', 2), ('B', 3)), known=[(0, 0, e.HIT), (2, 2, e.MISS)])
+    a = e.simulate(b, 400, seed=seed)
+    same = e.simulate(b, 400, seed=seed)
+    assert a.samples == 400 and a.consistent
+    assert a.counts == same.counts
+    assert a.probs == same.probs
+    assert sum(a.counts) == a.samples * 5
+    assert a.counts[0] == a.samples  # every sampled layout covers an un-sunk hit
+    assert a.counts[10] == 0  # every sampled layout excludes a miss
+    assert a.probs[0] == a.probs[10] == 0.0  # displayed known squares are not shots
+    assert sum(a.probs) == pytest.approx(4.0)  # 5 ship cells minus the one HIT
+    assert all(0 <= p <= 1 for p in a.probs)
 
 
-def test_sink_json_endpoint_converts_hit_line():
-    grid = [0] * 16
-    grid[5] = grid[6] = e.HIT
-    response = server.sink({'size': 4, 'grid': grid, 'fleet': [['Patrol', 2]],
-                            'sunk': [], 'ship': 'Patrol', 'last': 6})
-    assert response['converted'] == [5, 6]
-    assert response['grid'][5] == response['grid'][6] == e.SUNK
-    assert response['sunk'] == ['Patrol']
+def test_forced_layout_has_probability_one_and_known_hit_not_recommended():
+    b = small_board(4, known=[(r, c, e.MISS) for r in range(4) for c in range(4)
+                               if (r, c) not in {(1, 1), (1, 2)}])
+    b.set(1, 1, e.HIT)
+    sim = e.simulate(b, 250, seed=4)
+    assert sim.consistent and sim.samples == 250
+    assert sim.counts[5] == 250
+    assert sim.probs[5] == 0  # a hit is known, not a *next* shot
+    assert sim.probs[6] == 1
+    rec = e.recommend(b, sim)
+    assert rec['mode'] == 'target'
+    assert rec['best_name'] == 'B3'
 
 
-def test_invalid_grid_length_rejected():
-    with pytest.raises(ValueError, match='grid length'):
-        server.board_from({'size': 4, 'grid': [0] * 15})
+def test_impossible_disjoint_hits_rejected():
+    b = small_board(4, known=[(0, 0, e.HIT), (3, 3, e.HIT)])
+    sim = e.simulate(b, 30, seed=4)
+    assert not sim.consistent and sim.samples == 0
 
 
-@pytest.fixture
-def http_server():
-    httpd = ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f'http://127.0.0.1:{httpd.server_port}'
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=2)
+def test_no_remaining_ships_is_complete():
+    b = small_board(4, fleet=(('Patrol', 2),), known=[(0, 0, e.SUNK), (0, 1, e.SUNK)])
+    b.sunk_ships = ['Patrol']
+    sim = e.simulate(b, 100, seed=4)
+    assert sim.consistent and sim.samples == 0
+    assert sim.counts == [0] * 16
+    assert sim.probs == [0.0] * 16
+    assert e.recommend(b, sim)['mode'] == 'done'
 
 
-def post_json(url, payload):
-    request = Request(url, data=json.dumps(payload).encode('utf-8'),
-                      headers={'Content-Type': 'application/json'}, method='POST')
-    with urlopen(request, timeout=8) as response:
-        return response.status, json.load(response)
+def test_remaining_ship_restrictions_override_sunk_and_misses():
+    b = small_board(4, known=[(0, 0, e.SUNK), (0, 1, e.SUNK), (2, 2, e.MISS)],
+                    fleet=(('A', 2), ('B', 2)))
+    b.sunk_ships = ['A']
+    sim = e.simulate(b, 250, seed=3)
+    assert sim.consistent
+    assert sim.counts[0] == sim.counts[1] == sim.counts[10] == 0
+    assert sum(sim.counts) == 2 * sim.samples
+    assert sim.fit_counts[0] == sim.fit_counts[1] == sim.fit_counts[10] == 0
 
 
-def test_http_dashboard_serves_html_and_no_cache(http_server):
-    with urlopen(http_server + '/', timeout=8) as response:
-        html = response.read().decode('utf-8')
-        assert response.status == 200
-        assert response.headers['Cache-Control'] == 'no-store'
-        assert 'text/html' in response.headers['Content-Type']
-        assert '/api/analyze' in html and '/api/sink' in html
+def test_small_board_single_ship_matches_exact_oracle():
+    b = small_board(3, known=[(0, 0, e.MISS)])
+    expected, n_layouts = exact_probabilities(b)
+    assert n_layouts > 0
+    sim = e.simulate(b, 12000, seed=2026)
+    assert sim.samples == 12000
+    assert max(abs(a - b) for a, b in zip(sim.probs, expected)) < 0.025
 
 
-def test_http_analyze_and_sink_round_trip(http_server):
-    payload = {'size': 4, 'fleet': [['Patrol', 2]], 'samples': 200,
-               'grid': [e.MISS] * 16}
-    payload['grid'][5] = e.HIT
-    payload['grid'][6] = e.UNKNOWN
-    status, data = post_json(http_server + '/api/analyze', payload)
-    assert status == 200 and data['rec']['best_name'] == 'B3'
-    payload['grid'][6] = e.HIT
-    payload.update(ship='Patrol', last=6)
-    status, data = post_json(http_server + '/api/sink', payload)
-    assert status == 200 and data['converted'] == [5, 6]
+def test_random_layout_satisfies_non_overlap_and_no_touch():
+    for no_touch in (False, True):
+        for seed in (0, 1, 5):
+            import random
+            fleet = [('A', 3), ('B', 2), ('C', 2)]
+            layout = e.random_layout(size=6, fleet=fleet, rng=random.Random(seed), no_touch=no_touch)
+            assert [name for name, _ in layout] == [name for name, _ in fleet]
+            occupied = 0
+            halo = 0
+            for _, placement in layout:
+                assert not placement.mask & (halo if no_touch else occupied)
+                occupied |= placement.mask
+                halo |= placement.halo
+            assert occupied.bit_count() == 7
 
 
-def test_http_returns_400_for_bad_payload_and_404_for_unknown_route(http_server):
-    with pytest.raises(HTTPError) as exc:
-        post_json(http_server + '/api/analyze', {'size': 4, 'grid': [0]})
-    assert exc.value.code == 400
-    assert 'error' in json.load(exc.value)
-    with pytest.raises(HTTPError) as exc:
-        post_json(http_server + '/api/unknown', {})
-    assert exc.value.code == 404
+@pytest.mark.xfail(strict=True, reason='sampler chooses placements sequentially, biasing full-layout probabilities')
+def test_two_ship_posterior_matches_exact_enumeration():
+    b = small_board(size=3, fleet=(('Long', 3), ('Short', 2)))
+    expected, n_layouts = exact_probabilities(b)
+    assert n_layouts == 36
+    sim = e.simulate(b, 25000, seed=12)
+    assert sim.samples == 25000
+    assert max(abs(a - b) for a, b in zip(sim.probs, expected)) < 0.025
 
 
-@pytest.mark.xfail(strict=True, reason='server.board_from() does not validate known grid-state values')
-def test_api_rejects_unknown_grid_state_numbers():
-    grid = [0] * 16
-    grid[0] = 42
-    with pytest.raises(ValueError):
-        server.board_from({'size': 4, 'grid': grid})
-
-
-@pytest.mark.xfail(strict=True, reason='server.board_from() does not reject impossible ship lengths')
-def test_api_rejects_nonpositive_ship_length():
-    with pytest.raises(ValueError):
-        server.board_from({'size': 4, 'fleet': [['Broken', 0]]})
+def test_hit_adjacent_to_sunk_ship_is_impossible_under_no_touch():
+    b = small_board(size=4, fleet=(('Sunk', 2), ('Live', 2)), no_touch=True,
+                    known=[(0, 0, e.SUNK), (0, 1, e.SUNK), (1, 0, e.HIT)])
+    b.sunk_ships = ['Sunk']
+    expected, n = exact_probabilities(b)
+    assert n == 0
+    sim = e.simulate(b, 150, seed=10)
+    assert sim.samples == 0
+    assert not sim.consistent

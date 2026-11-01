@@ -399,7 +399,7 @@ function renderRec() {
   const rec = result.rec;
   $("rec-name").textContent = rec.best_name || "—";
   const m = $("rec-mode"); m.className = "badge " + rec.mode;
-  m.textContent = {hunt:"HUNT", target:"TARGET", done:"ALL SUNK"}[rec.mode];
+  m.textContent = {hunt:"HUNT", target:"TARGET", done:"ALL SUNK", inconsistent:"INVALID BOARD", unavailable:"NO SHOT"}[rec.mode] || "NO SHOT";
   $("rec-prob").textContent = rec.best != null
       ? `${(result.probs[rec.best]*100).toFixed(1)}% chance of a hit` : "";
   $("rec-reason").textContent = rec.reason;

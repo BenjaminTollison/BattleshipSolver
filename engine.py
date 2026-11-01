@@ -30,6 +30,7 @@ from __future__ import annotations
 import random
 import string
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 
 UNKNOWN, MISS, HIT, SUNK = 0, 1, 2, 3
@@ -89,6 +90,9 @@ def _neighbour_mask(idx: int, size: int) -> int:
 
 def placements_for(length: int, size: int):
     """All placements of a ship of `length` plus an index: cell -> placements."""
+    if (type(size) is not int or not 1 <= size <= 26 or
+            type(length) is not int or not 1 <= length <= size):
+        raise ValueError("size must be between 1 and 26; ship length must be between 1 and size")
     key = (length, size)
     if key in _PLACEMENT_CACHE:
         return _PLACEMENT_CACHE[key]
@@ -128,15 +132,47 @@ class Board:
     no_touch: bool = False
 
     def __post_init__(self):
+        if type(self.size) is not int or not 1 <= self.size <= 26:
+            raise ValueError("Board size must be an integer from 1 to 26")
         if not self.grid:
             self.grid = [UNKNOWN] * (self.size * self.size)
+        elif len(self.grid) != self.size * self.size:
+            raise ValueError("grid length does not match board size")
+        if any(type(state) is not int or state not in STATE_NAMES for state in self.grid):
+            raise ValueError("grid contains an unknown square state")
+        for name, length in self.fleet:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Ship names must be nonempty strings")
+            if type(length) is not int or not 1 <= length <= self.size:
+                raise ValueError("Ship lengths must be between 1 and board size")
+        # Repeated *identical* names are supported for custom duplicate fleets,
+        # but a name must identify a single length for auto_sink to be unambiguous.
+        for name in {name for name, _ in self.fleet}:
+            lengths = {length for candidate, length in self.fleet if candidate == name}
+            if len(lengths) > 1:
+                raise ValueError(f"Ship {name!r} has conflicting lengths")
+        remaining = Counter(name for name, _ in self.fleet)
+        for name in self.sunk_ships:
+            remaining[name] -= 1
+            if remaining[name] < 0:
+                raise ValueError(f"Ship {name!r} is not available to sink")
 
     # ---- helpers ---------------------------------------------------------- #
+    def _index(self, r, c):
+        # A raw flat-list index silently wraps (0, size) and accepts (-1, 0).
+        if (type(r) is not int or type(c) is not int or
+                not 0 <= r < self.size or not 0 <= c < self.size):
+            raise ValueError(f"Board coordinate out of bounds: ({r}, {c})")
+        return r * self.size + c
+
     def get(self, r, c):
-        return self.grid[r * self.size + c]
+        return self.grid[self._index(r, c)]
 
     def set(self, r, c, state):
-        self.grid[r * self.size + c] = state
+        idx = self._index(r, c)
+        if type(state) is not int or state not in STATE_NAMES:
+            raise ValueError(f"Unknown grid state: {state!r}")
+        self.grid[idx] = state
 
     def remaining_ships(self):
         """Fleet minus sunk ships (handles duplicate names/lengths correctly)."""
@@ -213,7 +249,9 @@ def simulate(board: Board, n_samples: int = 20000, seed=None,
         # squares next to a sunk ship can't hold another ship
         for i in range(ncell):
             if sunk_m >> i & 1:
-                blocked |= _neighbour_mask(i, size) & ~hit_m
+                # A hit in this halo makes the state inconsistent; it must NOT
+                # be exempted, because ships cannot touch under this house rule.
+                blocked |= _neighbour_mask(i, size)
 
     # legal placements for every remaining ship (static constraints only)
     valid = {}
@@ -331,6 +369,12 @@ def _max_run_fits(board: Board, idx: int, lengths) -> bool:
 
 def recommend(board: Board, sim: SimResult, use_parity: bool = True, top_n: int = 5):
     size = board.size
+    if not sim.consistent:
+        return {"mode": "inconsistent", "best": None, "best_name": None,
+                "ranked": [], "parity": None,
+                "reason": "The sampler found no fleet layout consistent with the recorded "
+                          "board. Check for mistakes or try more samples before "
+                          "requesting another shot."}
     lengths = [L for _, L in board.remaining_ships()]
     if not lengths:
         return {"mode": "done", "best": None, "ranked": [], "parity": None,
@@ -343,7 +387,10 @@ def recommend(board: Board, sim: SimResult, use_parity: bool = True, top_n: int 
     # only squares where a remaining ship can still fit
     candidates = [i for i in unknown if sim.probs[i] > 0 and _max_run_fits(board, i, lengths)]
     if not candidates:
-        candidates = unknown
+        return {"mode": "unavailable", "best": None, "best_name": None,
+                "ranked": [], "parity": None,
+                "reason": "No untried square has a positive estimated ship probability. "
+                          "Check the board or increase the simulation sample count."}
 
     mode = "target" if open_hits else "hunt"
     parity_info = None
@@ -396,9 +443,14 @@ def auto_sink(board: Board, ship_name: str, last_idx=None) -> list:
     hits in one direction), convert those squares to SUNK.  Returns the list of
     converted indices (empty if ambiguous - the user then marks them by hand).
     """
-    length = dict(board.fleet).get(ship_name)
+    # Validate before mutating, so invalid sink requests are atomic.
+    available = board.remaining_ships()
+    length = next((length for name, length in available if name == ship_name), None)
     if length is None:
-        raise ValueError(f"Unknown ship {ship_name!r}")
+        raise ValueError(f"Ship {ship_name!r} is unknown or already sunk")
+    if last_idx is not None and (type(last_idx) is not int or
+                                 not 0 <= last_idx < board.size * board.size):
+        raise ValueError(f"Last-hit index out of bounds: {last_idx!r}")
     board.sunk_ships.append(ship_name)
     if last_idx is None or board.grid[last_idx] != HIT:
         return []
