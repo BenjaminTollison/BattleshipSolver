@@ -3,3 +3,8 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+
+# Newly generated local benchmark results (already tracked snapshots stay tracked).
+runs/*.md
+runs/*.csv
+runs/*.csv.meta.json

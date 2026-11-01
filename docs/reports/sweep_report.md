@@ -1,6 +1,6 @@
 # Strategy benchmark
 
-Base 1,500 layouts per shot · enemy fleet seeds 1–1600 · rules: standard · config `382983f9834f` (code 553288cb864b8829, git 4963e54+modified) · 8 CPUs · Python 3.14.6
+Base 1,500 layouts per shot · enemy fleet seeds 1–1600 · rules: standard · config `382983f9834f` (code 553288cb864b8829, git ab5db1e) · 8 CPUs · Python 3.14.6
 
 Paired games completed by every strategy: **1600** (fleet seeds 1–1600)
 

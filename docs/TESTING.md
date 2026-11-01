@@ -68,8 +68,9 @@ scattered hits, no-touch, duplicate ship lengths, and a late-game position.
 ## Strategy experiments (`tests/test_strategies.py`)
 
 * The control replays `engine.play_game` exactly. This guarantees the strategy
-  benchmark's control matches `benchmark_1600.md`; it was also checked against the
-  committed `strategy_games.csv`.
+  benchmark's control matches the published `docs/reports/benchmark_1600.md`.
+  Its original CSV is preserved as `archive/legacy/strategy_games.csv` (legacy data
+  without modern run metadata).
 * Adaptive checkerboard: it leaves the grid only beyond `margin`; `margin=∞` gives
   the control and a negative margin gives greedy. Target mode is unchanged.
 * Lookahead: the 2-shot expected-hits value matches brute force; depth 1 is greedy;

@@ -1,7 +1,7 @@
 # Strategy experiments
 
 Baseline (frozen as the control): **auto + parity**, 44.54 shots per game over 1,600
-paired games (`benchmark_1600.md`, reproduced as `control` in `strategy_report.md`).
+paired games (`reports/benchmark_1600.md`, reproduced as `control` in `reports/strategy_report.md`).
 Every experiment changes exactly one part of it:
 
 | Strategy | Hunt mode | Target mode | Layouts per shot |
@@ -15,25 +15,30 @@ Every experiment changes exactly one part of it:
 Code: `strategies.py`. Tests: `tests/test_strategies.py`,
 `tests/test_benchmark_provenance.py`. Benchmark: `benchmarks/benchmark_strategies.py`.
 
-## Results so far (1,600 paired games, fleets 1–1,600)
+## Evidence so far
 
-From `strategy_report.md`. None of the first three experiments beat the baseline
-after Bonferroni correction:
+The original 1,600-game comparison is in [strategy_report.md](reports/strategy_report.md).
+None of those first three alternatives beat `control` after multiple-comparison
+correction. The later [sweep](reports/sweep_report.md) evaluated 14 variants,
+including `rollout_target` and a refined `adaptive_mc`.
 
-| Strategy | Δ shots vs control | Time per game | Role |
-|---|---:|---:|---|
-| `control` | — | 0.46 s | default gameplay |
-| `adaptive_parity` | +0.08 | 0.46 s | parameter tuning |
-| `lookahead_target` | +0.28 (hunt −0.60, target +0.89) | 0.65 s | research |
-| `adaptive_mc` (first version) | +0.47 (95% CI ≈ 0.00 to +0.94) | 0.38 s | speed experiment |
+In the separate [3,200-game held-out validation](reports/validation_report.md),
+`adaptive_parity:margin=0.4` averaged **44.67 shots**, versus **44.83** for
+`control` (paired difference **−0.16**, corrected 95% family-wise interval
+**−0.24 to −0.08**). The improvement is small but supported by that test.
+`adaptive_mc:eps=0.01` averaged **44.75 shots** and **0.32 s/game**, versus
+**0.46 s/game** for control; its shot advantage was not conclusive.
 
-`rollout_target` and the refined `adaptive_mc` are new and untested at scale.
+**Decision:** baseline remains the dashboard default. Adaptive parity at 40% is
+a candidate for promotion after additional held-out confirmation; adaptive MC is
+a speed option. The deeper expected-hits lookahead performed worse in the sweep.
+See [STATUS.md](STATUS.md) for the current decisions and next steps.
 
 ## How to run
 
 ```bash
-python -m pytest -q                                   # all tests (221)
-python benchmarks/benchmark_strategies.py --games 1600 --jobs 8 --csv runs/main.csv --out strategy_report.md
+python -m pytest -q
+python benchmarks/benchmark_strategies.py --games 1600 --jobs 8 --csv runs/new_main.csv --out runs/new_main.md
 ```
 
 A single-line progress bar on stderr shows the percentage, finished games, elapsed
@@ -48,15 +53,15 @@ time and ETA. The report goes to stdout and, with `--out`, to a file.
 
    ```bash
    python benchmarks/benchmark_strategies.py --preset sweep --jobs 8 \
-       --csv runs/sweep.csv --out sweep_report.md
+       --csv runs/new_sweep.csv --out runs/new_sweep.md
    ```
 
 2. **Validate** only the best one or two candidates on held-out fleets that were
    never used for development, with `--family-size` set to the number validated:
 
    ```bash
-   python benchmarks/benchmark_strategies.py control "adaptive_mc:min=1500,eps=0.01" \
-       --seed 100001 --games 1600 --family-size 1 --jobs 8 --csv runs/validate.csv --out validation_report.md
+   python benchmarks/benchmark_strategies.py control "adaptive_parity:margin=0.4" \
+       --seed 200001 --games 1600 --family-size 1 --jobs 8 --csv runs/new_validation.csv --out runs/new_validation.md
    ```
 
    Reports on fleets that overlap 1–1,600 carry a reminder to do this step.
