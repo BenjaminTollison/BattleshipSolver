@@ -1,0 +1,1028 @@
+diff --git a/.gitignore b/.gitignore
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,2 +10,5 @@
+ runs/*.csv.meta.json
+ runs/*.json
++
++# Opt-in local opponent game archive (never commit personal history).
++data/
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -89,3 +89,19 @@
+ changing the sampler or interpreting statistical differences.
+ 
++## Opponent memory (experimental)
++
++Enter an opponent name under **Opponent memory and saved games** in the dashboard.
++Choose **Won**, **Lost**, or **Unfinished**, then save the observed board. You can
++reload it later. **Unknown squares in a lost game stay unknown**: the tool never
++fabricates hidden ship positions. Games remain in local `data/games.json` (ignored
++by Git). Profiles are separated by opponent, board, fleet and touching rule.
++The new **Bayesian** strategy reweights legal fleets based on observed placement
++preferences. It remains experimental and is not known to outperform the control.
++See [opponent-learning details](docs/OPPONENT_LEARNING.md).
++
++```bash
++python benchmarks/benchmark_opponent_learning.py --games 100 --history-games 20 \
++  --samples 1000 --jobs 8 --out runs/opponent_learning.md
++```
++
+ ## Repository map
+@@ -105,3 +105,5 @@
+ | `engine.py` | Fleet rules, placement probabilities, recommendations |
+ | `strategies.py` | Baseline and experimental shot-selection policies |
++| `opponent_learning.py`, `game_history.py` | Bayesian placement prior and local game archive |
++| `benchmarks/benchmark_opponent_learning.py` | Paired uniform/adversarial opponent-learning test |
+ | `server.py`, `dashboard.html` | Local API and interactive dashboard |
+diff --git a/dashboard.html b/dashboard.html
+--- a/dashboard.html
++++ b/dashboard.html
+@@ -269,3 +269,4 @@
+             <select id="strategy">
+               <option value="control" selected>Baseline: checkerboard + best square</option>
++              <option value="bayesian">Bayesian: learn from saved opponent games</option>
+               <optgroup label="Experimental (not shown to beat the baseline)">
+@@ -287,4 +287,30 @@
+         <button id="newgame">New game</button>
+       </div>
++    </div>
++    <div class="card" id="games-card">
++      <h2>Opponent memory and saved games</h2>
++      <label>Opponent name <input id="opponent" type="text" maxlength="64"
++        placeholder="Enter a name to keep histories separate"></label>
++      <div class="note">Saved games stay on this computer. A loss can be saved with
++        missing ship positions; unplayed squares remain unknown and are never
++        counted as water. The Bayesian policy learns only from observed squares.</div>
++      <div class="row" style="margin-top:10px">
++        <label>Result
++          <select id="game-outcome">
++            <option value="unfinished" selected>Unfinished / stopped</option>
++            <option value="won">Won</option>
++            <option value="lost">Lost — remaining ships unknown</option>
++          </select>
++        </label>
++        <button class="primary" id="save-game">Save current game</button>
++      </div>
++      <div class="row" style="margin-top:10px">
++        <label style="flex:1">Previously saved games
++          <select id="saved-games" style="max-width:100%;width:100%"></select>
++        </label>
++        <button id="load-game">Load</button>
++        <button id="refresh-games">Refresh</button>
++      </div>
++      <div class="note" id="games-msg" role="status"></div>
+     </div>
+   </section>
+@@ -305,5 +305,7 @@
+ function freshState(size) {
+   return { size, grid: Array(size*size).fill(0), fleet: STD_FLEET.map(x => [...x]),
+-           sunk: [], lastHit: null, log: [] };
++           sunk: [], lastHit: null, log: [],
++           session_id: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() :
++             Date.now().toString(36) + "-" + Math.random().toString(36).slice(2) };
+ }
+ const name = i => ROWS[Math.floor(i / S.size)] + (i % S.size + 1);
+@@ -333,3 +333,4 @@
+                  no_touch: $("notouch").checked, parity: $("parity").checked,
+-                 samples: +$("samples").value, strategy: $("strategy").value, ...extra };
++                 samples: +$("samples").value, strategy: $("strategy").value,
++                 opponent: $("opponent").value.trim(), session_id: S.session_id, ...extra };
+   const r = await fetch(path, { method: "POST", headers: {"Content-Type":"application/json"},
+@@ -582,5 +582,66 @@
+ $("size").onchange = $("newgame").onclick;
+ 
++// -------- opt-in, local game archive --------
++async function refreshGames() {
++  const select = $("saved-games");
++  const wanted = select.value;
++  const response = await fetch("/api/games", {cache: "no-store"});
++  const data = await response.json();
++  if (!response.ok) throw new Error(data.error || response.statusText);
++  const current = $("opponent").value.trim();
++  select.replaceChildren();
++  const filtered = (data.games || []).filter(g => !current || g.opponent === current);
++  for (const g of filtered) {
++    const option = document.createElement("option");
++    option.value = g.id;
++    option.textContent = `${g.opponent} · ${g.outcome} · ${g.observed} observed / ${g.unknown} unknown · ${g.saved_at.slice(0, 10)}`;
++    select.appendChild(option);
++  }
++  if ([...select.options].some(o => o.value === wanted)) select.value = wanted;
++  if (!filtered.length) $("games-msg").textContent = "No saved games for this opponent yet.";
++}
++$("opponent").addEventListener("change", () => {
++  try { localStorage.setItem("bs-opponent", $("opponent").value); } catch (e) {}
++  refreshGames().catch(e => $("games-msg").textContent = e.message);
++  if ($("strategy").value === "bayesian") analyze();
++});
++$("save-game").onclick = async () => {
++  if (!$("opponent").value.trim()) {
++    $("games-msg").textContent = "Enter an opponent name first."; return;
++  }
++  try {
++    const saved = await api("/api/games", {outcome: $("game-outcome").value});
++    $("games-msg").textContent = `Saved ${saved.outcome}: ${saved.observed} observed; ${saved.unknown} unknown. No hidden locations were invented.`;
++    await refreshGames();
++    if ($("strategy").value === "bayesian") analyze();
++  } catch (e) { $("games-msg").textContent = "Save failed: " + e.message; }
++};
++$("refresh-games").onclick = () => refreshGames().catch(e => $("games-msg").textContent = e.message);
++$("load-game").onclick = async () => {
++  const id = $("saved-games").value;
++  if (!id) { $("games-msg").textContent = "Choose a saved game."; return; }
++  if (!confirm("Replace the current board with this saved observation?")) return;
++  try {
++    const response = await fetch("/api/games/" + encodeURIComponent(id));
++    const game = await response.json();
++    if (!response.ok) throw new Error(game.error || response.statusText);
++    snapshot();
++    S = freshState(game.size);
++    S.grid = [...game.grid]; S.fleet = game.fleet.map(x => [...x]);
++    S.sunk = [...game.sunk]; S.session_id = game.session_id || S.session_id;
++    S.log = [`Loaded saved ${game.outcome} game (move order not reconstructed)`];
++    $("size").value = String(game.size);
++    $("notouch").checked = !!game.no_touch;
++    $("opponent").value = game.opponent;
++    editFleet = null;
++    changed();
++    $("games-msg").textContent = `Loaded: ${game.unknown} squares still unknown.`;
++  } catch (e) { $("games-msg").textContent = "Load failed: " + e.message; }
++};
++try { $("opponent").value = localStorage.getItem("bs-opponent") || ""; } catch (e) {}
++refreshGames().catch(e => $("games-msg").textContent = e.message);
++
+ load();
++if (!S.session_id) S.session_id = freshState(S.size).session_id;
+ $("size").value = S.size;
+ changed();
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -11,3 +11,6 @@
+ - **Default policy:** `control` (auto + checkerboard hunting + best-probability
+   target selection); deliberately unchanged.
++- **Opponent learning (experimental):** separate Bayesian regional occupancy priors
++  learned from opt-in, partially observed saved games. Frozen adversarial placement
++  code and published reports remain untouched. See [OPPONENT_LEARNING.md](OPPONENT_LEARNING.md).
+ - **Alternatives:** adaptive checkerboard, expected-hits lookahead,
+diff --git a/server.py b/server.py
+--- a/server.py
++++ b/server.py
+@@ -16,4 +16,6 @@
+ import engine
+ import strategies
++import game_history
++import opponent_learning
+ 
+ HERE = Path(__file__).resolve().parent
+@@ -69,10 +69,30 @@
+     if not isinstance(spec, str):
+         raise ValueError("strategy must be a string")
+-    strat = strategies.make(spec)            # raises ValueError for unknown specs
+-    if strat.name == "control":
+-        # Baseline: unchanged recommendation path.
+-        sim = engine.simulate(board, samples, method=method)
+-        rec = engine.recommend(board, sim, use_parity=use_parity)
++    profile_info = None
++    if spec == "bayesian":
++        # Separate, opt-in opponent-conditioned path. All other strategies,
++        # including the frozen control and adversarial generator, are unchanged.
++        opponent = game_history.normalize_opponent(payload.get("opponent", ""))
++        profile = opponent_learning.fit_profile(game_history.all_games(), opponent,
++                                                board.size, board.fleet, board.no_touch)
++        sim, rec, weighting = opponent_learning.recommend(
++            board, samples, profile, use_parity=use_parity, method=method)
++        strategy_name = "bayesian"
++        profile_info = {"opponent": opponent, "games": profile["games"],
++                        "observed": profile["observed"],
++                        "effective_samples": round(weighting["ess"], 1),
++                        "tempering": weighting["tempering"]}
++        if profile["games"] == 0:
++            rec["reason"] = "No matching saved games: using the uniform baseline. " + rec["reason"]
++        else:
++            rec["reason"] = f"Bayesian opponent profile ({profile['games']} saved games). " + rec["reason"]
+     else:
+-        sim, rec = _strategy_recommendation(board, strat, samples, method, use_parity)
++        strat = strategies.make(spec)            # raises ValueError for unknown specs
++        strategy_name = strat.label()
++        if strat.name == "control":
++            # Baseline: unchanged recommendation path.
++            sim = engine.simulate(board, samples, method=method)
++            rec = engine.recommend(board, sim, use_parity=use_parity)
++        else:
++            sim, rec = _strategy_recommendation(board, strat, samples, method, use_parity)
+     warnings = board.warnings()
+@@ -93,3 +93,4 @@
+         "rec": rec,
+-        "strategy": strat.label(),
++        "strategy": strategy_name,
++        "opponent_profile": profile_info,
+         "remaining": board.remaining_ships(),
+@@ -132,4 +132,9 @@
+         if self.path in ("/", "/index.html"):
+             self._send(200, (HERE / "dashboard.html").read_bytes(), "text/html; charset=utf-8")
++        elif self.path == "/api/games":
++            self._send(200, {"games": game_history.list_games()})
++        elif self.path.startswith("/api/games/"):
++            game = game_history.get_game(self.path[len("/api/games/"):])
++            self._send(200, game) if game is not None else self._send(404, {"error": "not found"})
+         else:
+             self._send(404, {"error": "not found"})
+@@ -142,9 +142,16 @@
+         try:
+             n = int(self.headers.get("Content-Length", 0))
++            if not 0 <= n <= 128_000:
++                self._send(413, {"error": "request too large"})
++                return
+             payload = json.loads(self.rfile.read(n) or b"{}")
++            if not isinstance(payload, dict):
++                raise ValueError("request body must be an object")
+             if self.path == "/api/analyze":
+                 self._send(200, analyze(payload))
+             elif self.path == "/api/sink":
+                 self._send(200, sink(payload))
++            elif self.path == "/api/games":
++                self._send(200, game_history.save(payload, board_from(payload)))
+             else:
+                 self._send(404, {"error": "not found"})
+diff --git a/opponent_learning.py b/opponent_learning.py
+new file mode 100644
+--- /dev/null
++++ b/opponent_learning.py
+@@ -0,0 +1,153 @@
++"""Bayesian opponent placement prior, separate from the frozen adversary.
++
++We learn *regional occupancy rates*, not a fake completed board. Each saved game's
++UNKNOWN squares are censored; only observed HIT/SUNK and MISS cells contribute to
++the Beta posterior. These are descriptive rates of observed cells, so adaptive
++shot-selection can introduce selection bias. Strong shrinkage, weight tempering,
++and evaluation on fresh fleets are important safeguards.
++
++This is a lightweight exploratory opponent model, not an exact Bayesian posterior
++for the full opponent placement strategy. Fleet-level correlations remain handled
++by the existing legal-layout sampler; the regional prior weights complete legal
++layouts rather than generating independently occupied squares.
++"""
++from __future__ import annotations
++
++import dataclasses
++import functools
++import math
++import random
++
++import engine
++
++MODEL_VERSION = "regional-beta-v1"
++PRIOR_STRENGTH = 120.0  # pseudo-observations per region (not games)
++MAX_LOG_ODDS = 1.0       # prevent a handful of outcomes dominating full fleets
++MIN_ESS_FRACTION = 0.20
++
++
++def region(index, size):
++    r, c = divmod(index, size)
++    d = min(r, c, size - 1 - r, size - 1 - c)
++    return min(d, 2)  # outer edge, inner ring, interior
++
++
++@functools.lru_cache(maxsize=24)
++def uniform_region_rates(size, fleet, no_touch, n=1200):
++    """Uniform *legal fleet* reference, estimated once per ruleset."""
++    rng = random.Random(20261101)
++    cells = [0] * 3
++    hits = [0] * 3
++    for i in range(size * size):
++        cells[region(i, size)] += 1
++    for _ in range(n):
++        ships = engine.random_layout(size, list(fleet), rng, no_touch)
++        for _, placement in ships:
++            for i in placement.cells:
++                hits[region(i, size)] += 1
++    return tuple(h / (n * cnt) if cnt else 0.0 for h, cnt in zip(hits, cells))
++
++
++def _logit(p):
++    p = min(0.99999, max(0.00001, p))
++    return math.log(p / (1.0 - p))
++
++
++def rules_key(size, fleet, no_touch):
++    return (size, tuple((str(name), int(length)) for name, length in fleet), bool(no_touch))
++
++
++def fit_profile(games, opponent, size, fleet, no_touch, prior_strength=PRIOR_STRENGTH):
++    """Return a regularized opponent prior. Never fill unobserved cells.
++
++    Names and rule configurations must match exactly. Completed and lost games
++    use precisely the same observation rule, so a loss isn't fabricated as a
++    fully revealed fleet. No history = gamma 0 and uniform baseline behavior.
++    """
++    key = rules_key(size, fleet, no_touch)
++    base = uniform_region_rates(*key)
++    a = [max(1e-6, p * prior_strength) for p in base]
++    b = [max(1e-6, (1.0 - p) * prior_strength) for p in base]
++    observed = 0
++    game_count = 0
++    for game in games:
++        if game.get("opponent") != opponent:
++            continue
++        if rules_key(game["size"], game["fleet"], game["no_touch"]) != key:
++            continue
++        game_count += 1
++        # An observation has a single state, not a possibly inferred fleet.
++        for i, state in enumerate(game["grid"]):
++            if state in (engine.HIT, engine.SUNK):
++                a[region(i, size)] += 1
++                observed += 1
++            elif state == engine.MISS:
++                b[region(i, size)] += 1
++                observed += 1
++    posterior = tuple(a[k] / (a[k] + b[k]) for k in range(3))
++    gamma = tuple(max(-MAX_LOG_ODDS, min(MAX_LOG_ODDS, _logit(p) - _logit(q)))
++                  if q > 0 else 0.0 for p, q in zip(posterior, base))
++    return {"version": MODEL_VERSION, "games": game_count, "observed": observed,
++            "uniform_rates": base, "posterior_rates": posterior, "gamma": gamma}
++
++
++def reweight(board, sim, profile):
++    """Posterior occupancy of *valid complete remaining fleets* under prior.
++
++    Exact enumeration stays exact after reweighting. A weighted base sampler
++    requires multiplying the original importance weights by the opponent
++    prior; otherwise we'd reintroduce the historic sequential-sampling bias.
++    When weights degenerate, temper the opponent prior to an ESS floor.
++    """
++    if not profile["games"] or not sim.consistent or not sim.layouts:
++        return sim, {"tempering": 0.0 if not profile["games"] else None,
++                     "ess": sim.ess}
++    masks = sim.layouts
++    base_weights = sim.layout_weights or [1.0] * len(masks)
++    mask = [sum(1 << i for i in range(board.size * board.size)
++                if region(i, board.size) == k) for k in range(3)]
++    gamma = profile["gamma"]
++    scores = [sum(gamma[k] * (m & mask[k]).bit_count() for k in range(3))
++              for m in masks]
++    # Weighted samples can already have a small ESS before adaptation.
++    base_ess = sum(base_weights) ** 2 / sum(w*w for w in base_weights)
++    floor = min(base_ess, max(10.0, MIN_ESS_FRACTION * len(masks)))
++    weights = None
++    tempering = 0.0
++    for temp in (1.0, 0.75, 0.5, 0.3, 0.15, 0.0):
++        max_score = max(scores)
++        trial = [w * math.exp(temp * (score - max_score))
++                 for w, score in zip(base_weights, scores)]
++        total = sum(trial)
++        sq = sum(w*w for w in trial)
++        ess = total * total / sq if sq else 0.0
++        if ess >= floor - 1e-9 or temp == 0.0:
++            weights, tempering = trial, temp
++            break
++    wtotal = sum(weights)
++    counts = [0.0] * (board.size * board.size)
++    for layout, weight in zip(masks, weights):
++        m = layout
++        while m:
++            low = m & -m
++            counts[low.bit_length() - 1] += weight
++            m ^= low
++    probs = [v / wtotal for v in counts]
++    for i, state in enumerate(board.grid):
++        if state != engine.UNKNOWN:
++            probs[i] = 0.0
++    adjusted = dataclasses.replace(sim, probs=probs,
++                                   counts=[v / wtotal * sim.samples for v in counts],
++                                   ess=ess)
++    return adjusted, {"tempering": tempering, "ess": ess}
++
++
++def recommend(board, samples, profile, seed=None, use_parity=True, method="auto"):
++    """Same solver, differently weighted prior. Uniform/no-history is control."""
++    keep = bool(profile["games"])
++    sim = engine.simulate(board, samples, seed=seed, method=method, keep_layouts=keep)
++    if keep:
++        sim, details = reweight(board, sim, profile)
++    else:
++        details = {"tempering": 0.0, "ess": sim.ess}
++    return sim, engine.recommend(board, sim, use_parity=use_parity), details
+diff --git a/game_history.py b/game_history.py
+new file mode 100644
+--- /dev/null
++++ b/game_history.py
+@@ -0,0 +1,121 @@
++"""Local opt-in game archive; partially observed losses are never completed.
++
++The caller validates the Board with server.board_from before saving. No saved
++record can turn an UNKNOWN square into a MISS by inference. No cloud services.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import threading
++import uuid
++from datetime import datetime, timezone
++
++import engine
++
++_LOCK = threading.RLock()
++MAX_GAMES = 10000
++VALID_OUTCOMES = {"won", "lost", "unfinished"}
++
++
++def store_path():
++    return Path(os.environ.get("BATTLESHIP_GAME_HISTORY",
++                               str(Path(__file__).resolve().parent / "data" / "games.json")))
++
++
++def normalize_opponent(value):
++    if not isinstance(value, str):
++        raise ValueError("opponent must be text")
++    name = value.strip()
++    if not 1 <= len(name) <= 64 or any(ord(x) < 32 for x in name):
++        raise ValueError("opponent name must be 1–64 printable characters")
++    return name
++
++
++def _read():
++    path = store_path()
++    if not path.exists():
++        return []
++    data = json.loads(path.read_text(encoding="utf-8"))
++    if not isinstance(data, list):
++        raise ValueError("game history file is not a list")
++    return data
++
++
++def _atomic_write(games):
++    path = store_path()
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
++    try:
++        with tmp.open("w", encoding="utf-8") as f:
++            json.dump(games, f, ensure_ascii=False, indent=2)
++            f.write("\n")
++            f.flush()
++            os.fsync(f.fileno())
++        os.replace(tmp, path)
++    finally:
++        tmp.unlink(missing_ok=True)
++
++
++def save(payload, board):
++    opponent = normalize_opponent(payload.get("opponent", ""))
++    outcome = payload.get("outcome")
++    if outcome not in VALID_OUTCOMES:
++        raise ValueError("outcome must be won, lost, or unfinished")
++    # Never complete or alter the submitted observation grid.
++    grid = list(board.grid)
++    known = sum(x != engine.UNKNOWN for x in grid)
++    if known == 0:
++        raise ValueError("cannot save an empty game")
++    session_id = payload.get("session_id")
++    if session_id is not None:
++        if not isinstance(session_id, str) or not 1 <= len(session_id) <= 80 or any(ord(c) < 33 for c in session_id):
++            raise ValueError("invalid game session id")
++    record = {"id": uuid.uuid4().hex, "session_id": session_id, "saved_at": datetime.now(timezone.utc).isoformat(),
++              "opponent": opponent, "outcome": outcome, "size": board.size,
++              "fleet": [list(x) for x in board.fleet], "no_touch": bool(board.no_touch),
++              "grid": grid, "sunk": list(board.sunk_ships),
++              "observed": known, "unknown": len(grid) - known,
++              "complete_layout": bool(outcome == "won" and len(board.sunk_ships) == len(board.fleet)
++                                      and all(v != engine.HIT for v in grid))}
++    with _LOCK:
++        games = _read()
++        existing = next((j for j, g in enumerate(games)
++                         if session_id and g.get("session_id") == session_id), None)
++        if existing is not None:
++            previous = games[existing]
++            if previous["opponent"] != opponent or previous["size"] != board.size or \
++                    previous["fleet"] != record["fleet"] or previous["no_touch"] != record["no_touch"]:
++                raise ValueError("saved game identity/rules changed; start a new game session")
++            record["id"] = previous["id"]
++            games[existing] = record  # update the snapshot, never double-count one game
++        else:
++            if len(games) >= MAX_GAMES:
++                raise ValueError("game archive limit reached; export or back up existing games")
++            games.append(record)
++        _atomic_write(games)
++    return {k: record[k] for k in ("id", "saved_at", "opponent", "outcome", "observed",
++                                    "unknown", "complete_layout")}
++
++
++def list_games(opponent=None):
++    with _LOCK:
++        games = _read()
++    if opponent:
++        opponent = normalize_opponent(opponent)
++        games = [g for g in games if g["opponent"] == opponent]
++    return [{k: g[k] for k in ("id", "saved_at", "opponent", "outcome", "observed",
++                                 "unknown", "complete_layout")} for g in reversed(games)]
++
++
++def all_games():
++    with _LOCK:
++        return _read()
++
++
++def get_game(game_id):
++    if not isinstance(game_id, str) or len(game_id) != 32 or any(c not in "0123456789abcdef" for c in game_id):
++        return None
++    with _LOCK:
++        return next((g for g in _read() if g["id"] == game_id), None)
+diff --git a/benchmarks/benchmark_opponent_learning.py b/benchmarks/benchmark_opponent_learning.py
+new file mode 100644
+--- /dev/null
++++ b/benchmarks/benchmark_opponent_learning.py
+@@ -0,0 +1,215 @@
++"""Compare a frozen control with a Bayesian prior trained on earlier *partial* games.
++
++The adversarial placement generator is only imported/called, never modified.
++Training uses one independent set of seeds; evaluation uses another. Within
++an evaluation game, baseline and learned solver see the identical enemy fleet.
++
++Example:
++ python benchmarks/benchmark_opponent_learning.py --games 100 --history-games 30 \
++    --samples 1000 --jobs 8 --out runs/opponent_learning.md
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import math
++import multiprocessing as mp
++import random
++import statistics
++import sys
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++
++import adversary
++import engine
++import opponent_learning as learning
++
++CEM_STANDARD = "obscurity=2.4,spread=1.9,edge=1.5,contact=-1.1,aligned=0.7,ring1=-0.4,parallel=-0.2"
++CEM_NO_TOUCH = "spread=3.6,edge=3.1,obscurity=1.0,parallel=1.0,aligned=0.6,contact=-0.2,ring1=-0.1"
++POLICIES = ("uniform", "edge_hugger", "spread_out", "cem_best")
++
++
++def placement_policy(name, no_touch):
++    return adversary.parse_policy((CEM_NO_TOUCH if no_touch else CEM_STANDARD)
++                                  if name == "cem_best" else name)
++
++
++def make_observation(layout, size, fleet, no_touch, n, rng):
++    """A simulated *lost/unfinished* game with a fixed set of observed squares.
++
++    We do not fill other ship locations even though the simulator knows them.
++    Random exploration is used for training to avoid selecting shots with the
++    very prior we are trying to learn. This is a controlled synthetic setting,
++    not a claim that real human play collects randomly selected shots.
++    """
++    grid = [engine.UNKNOWN] * (size * size)
++    ship_cells = {i for _, p in layout for i in p.cells}
++    for i in rng.sample(range(size * size), min(n, size * size)):
++        grid[i] = engine.HIT if i in ship_cells else engine.MISS
++    return {"opponent": "synthetic", "outcome": "lost", "size": size,
++            "fleet": [list(x) for x in fleet], "no_touch": no_touch,
++            "grid": grid, "sunk": []}
++
++
++def make_training(policy, seed, count, observations, size, fleet, no_touch, mcmc_steps):
++    records = []
++    for j in range(count):
++        layout = adversary.sample_layout(policy, size, fleet, no_touch,
++                                         random.Random(f"train-layout-{seed+j}"), mcmc_steps)
++        records.append(make_observation(layout, size, fleet, no_touch, observations,
++                                        random.Random(f"train-shots-{seed+j}")))
++    return records
++
++
++def play_one(layout, size, fleet, no_touch, seed, samples, profile=None):
++    rng = random.Random(seed * 7919 + 1)
++    board = engine.Board(size=size, fleet=list(fleet), no_touch=no_touch)
++    alive = {k: set(p.cells) for k, (_, p) in enumerate(layout)}
++    names = {k: n for k, (n, _) in enumerate(layout)}
++    cells = {k: p.cells for k, (_, p) in enumerate(layout)}
++    shots = hunt = 0
++    while board.remaining_ships() and shots < size * size:
++        if profile is None:
++            sim = engine.simulate(board, samples, seed=rng.random(), method="auto")
++        else:
++            sim = engine.simulate(board, samples, seed=rng.random(), method="auto",
++                                  keep_layouts=True)
++            sim, _ = learning.reweight(board, sim, profile)
++        rec = engine.recommend(board, sim, use_parity=True)
++        i = rec["best"]
++        if i is None or board.grid[i] != engine.UNKNOWN:
++            raise RuntimeError("invalid recommendation in benchmark")
++        shots += 1
++        hunt += engine.HIT not in board.grid
++        owner = next((k for k, cs in alive.items() if i in cs), None)
++        if owner is None:
++            board.grid[i] = engine.MISS
++        else:
++            board.grid[i] = engine.HIT
++            alive[owner].remove(i)
++            if not alive[owner]:
++                board.sunk_ships.append(names[owner])
++                for j in cells[owner]:
++                    board.grid[j] = engine.SUNK
++                del alive[owner]
++    return shots, hunt
++
++
++def worker(args):
++    policy_name, no_touch, size, fleet, mcmc_steps, seed, samples, profile = args
++    policy = placement_policy(policy_name, no_touch)
++    layout = adversary.sample_layout(policy, size, fleet, no_touch,
++                                     random.Random(f"eval-layout-{seed}"), mcmc_steps)
++    baseline = play_one(layout, size, fleet, no_touch, seed, samples)
++    learned = play_one(layout, size, fleet, no_touch, seed, samples, profile)
++    return (policy_name, seed, *baseline, *learned)
++
++
++def _progress(done, total, start):
++    elapsed = time.monotonic() - start
++    eta = elapsed / done * (total - done) if done else 0
++    filled = round(26 * done / max(1, total))
++    print(f"\r[{'█'*filled}{'░'*(26-filled)}] {done}/{total} "
++          f"({100*done/max(1,total):.1f}%) elapsed {elapsed:.0f}s ETA {eta:.0f}s",
++          file=sys.stderr, end="\n" if done == total else "", flush=True)
++
++
++def summarize(rows, histories, args):
++    out = ["# Opponent-learning benchmark", "",
++           f"Rules: {'no-touch' if args.no_touch else 'standard'} · "
++           f"{args.games} held-out games/policy · {args.history_games} previous partial games · "
++           f"{args.train_observations} observed squares/training game · "
++           f"{args.samples} layouts/shot", "",
++           "The adversary generator and the existing baseline are unchanged. "
++           "Train/test seeds are disjoint; the same enemy fleet is used for both solvers.", "",
++           "| Opponent policy | Control shots | Learned shots | Paired Δ | 95% CI of Δ | History observations |",
++           "|---|---:|---:|---:|---|---:|"]
++    for policy in args.policies:
++        run = [r for r in rows if r[0] == policy]
++        if not run:
++            continue
++        ctrl = [r[2] for r in run]
++        bayes = [r[4] for r in run]
++        diff = [b - c for b, c in zip(bayes, ctrl)]
++        mean = statistics.mean(diff)
++        se = statistics.stdev(diff) / math.sqrt(len(diff)) if len(diff) > 1 else float('nan')
++        out.append(f"| {policy} | {statistics.mean(ctrl):.2f} | "
++                   f"{statistics.mean(bayes):.2f} | {mean:+.2f} | "
++                   f"{mean-1.96*se:+.2f} to {mean+1.96*se:+.2f} | "
++                   f"{histories[policy]['observed']} |")
++    out.extend(["", "Negative paired differences favor the learned prior. "
++                "This benchmark uses synthetic *randomly observed* partial games "
++                "for training and does not demonstrate real-human generalization.",
++                "", "Repeated CEM weights were copied from previously published reports; "
++                "no new adversarial search is performed."])
++    return "\n".join(out) + "\n"
++
++
++def main(argv=None):
++    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    p.add_argument("--games", type=int, default=100)
++    p.add_argument("--history-games", type=int, default=20)
++    p.add_argument("--train-observations", type=int, default=40)
++    p.add_argument("--samples", type=int, default=1000)
++    p.add_argument("--jobs", type=int, default=1)
++    p.add_argument("--train-seed", type=int, default=500001)
++    p.add_argument("--eval-seed", type=int, default=600001)
++    p.add_argument("--mcmc-steps", type=int, default=800)
++    p.add_argument("--no-touch", action="store_true")
++    p.add_argument("--size", type=int, default=10)
++    p.add_argument("--fleet", default="", help="name:length,... (default standard fleet)")
++    p.add_argument("--policies", nargs="+", choices=POLICIES, default=list(POLICIES))
++    p.add_argument("--out", default="runs/opponent_learning.md")
++    p.add_argument("--csv", default="runs/opponent_learning.csv")
++    args = p.parse_args(argv)
++    if min(args.games, args.history_games, args.train_observations, args.samples,
++           args.jobs, args.mcmc_steps) <= 0:
++        p.error("games, history, observations, samples, jobs and steps must be positive")
++    if (args.train_seed <= args.eval_seed < args.train_seed + args.history_games or
++            args.eval_seed <= args.train_seed < args.eval_seed + args.games):
++        p.error("training and evaluation seed ranges must not overlap")
++    fleet = ([tuple((n, int(length))) for n, length in
++              (part.split(":", 1) for part in args.fleet.split(","))]
++             if args.fleet else list(engine.DEFAULT_FLEET))
++    args.policies = list(dict.fromkeys(args.policies))
++    profiles = {}
++    for name in args.policies:
++        recs = make_training(placement_policy(name, args.no_touch), args.train_seed,
++                             args.history_games, args.train_observations,
++                             args.size, fleet, args.no_touch, args.mcmc_steps)
++        profiles[name] = learning.fit_profile(recs, "synthetic", args.size, fleet, args.no_touch)
++        print(f"Profile {name}: {profiles[name]['games']} games, "
++              f"{profiles[name]['observed']} observed squares", file=sys.stderr)
++    tasks = [(name, args.no_touch, args.size, fleet, args.mcmc_steps, args.eval_seed + j,
++              args.samples, profiles[name])
++             for name in args.policies for j in range(args.games)]
++    t0 = time.monotonic()
++    rows = []
++    if args.jobs == 1:
++        iterator = map(worker, tasks)
++        for i, result in enumerate(iterator, 1):
++            rows.append(result)
++            _progress(i, len(tasks), t0)
++    else:
++        with mp.Pool(args.jobs) as pool:
++            for i, result in enumerate(pool.imap_unordered(worker, tasks), 1):
++                rows.append(result)
++                _progress(i, len(tasks), t0)
++    output = summarize(rows, profiles, args)
++    print(output)
++    path = Path(args.out)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(output, encoding="utf-8")
++    path = Path(args.csv)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("w", encoding="utf-8", newline="") as f:
++        w = csv.writer(f)
++        w.writerow(["policy", "eval_seed", "control_shots", "control_hunt", "bayesian_shots", "bayesian_hunt"])
++        w.writerows(sorted(rows))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_opponent_learning.py b/tests/test_opponent_learning.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_opponent_learning.py
+@@ -0,0 +1,176 @@
++"""Bayesian opponent learning, no information leakage from incomplete games."""
++import dataclasses
++import random
++from types import SimpleNamespace
++
++import pytest
++
++import engine as e
++import game_history
++import opponent_learning as ol
++
++
++def small_board():
++    return e.Board(size=5, fleet=[('A', 2), ('B', 3)])
++
++
++def record(grid, opponent='Pat', no_touch=False, outcome='lost'):
++    return dict(opponent=opponent, outcome=outcome, size=5,
++                fleet=[['A', 2], ['B', 3]], no_touch=no_touch, grid=grid, sunk=[])
++
++
++def test_zero_history_is_uniform_fallback(monkeypatch):
++    monkeypatch.setattr(ol, 'uniform_region_rates', lambda *a: (0.2, 0.2, 0.2))
++    p = ol.fit_profile([], 'Pat', 5, small_board().fleet, False)
++    assert p['gamma'] == (0.0, 0.0, 0.0)
++    assert p['games'] == 0
++
++
++def test_censored_loss_does_not_label_unknown_water(monkeypatch):
++    monkeypatch.setattr(ol, 'uniform_region_rates', lambda *a: (0.2, 0.2, 0.2))
++    grid = [0] * 25
++    grid[0] = e.HIT
++    grid[12] = e.MISS
++    p = ol.fit_profile([record(grid)], 'Pat', 5, small_board().fleet, False)
++    assert p['observed'] == 2
++    # Only a single observed hit and miss count; 23 unknowns never become misses.
++    assert p['posterior_rates'][0] == pytest.approx((24 + 1) / (120 + 1))
++    assert p['posterior_rates'][2] == pytest.approx((24 + 0) / 121)
++
++
++def test_profiles_do_not_cross_opponents_or_rules(monkeypatch):
++    monkeypatch.setattr(ol, 'uniform_region_rates', lambda *a: (0.2, 0.2, 0.2))
++    a = [0] * 25
++    a[0] = e.HIT
++    b = [0] * 25
++    b[0] = e.MISS
++    games = [record(a), record(b, opponent='Other'), record(b, no_touch=True)]
++    p = ol.fit_profile(games, 'Pat', 5, small_board().fleet, False)
++    assert p['games'] == 1 and p['observed'] == 1
++    assert p['posterior_rates'][0] > 0.2
++
++
++@dataclasses.dataclass
++class FakeSim:
++    probs: list
++    counts: list
++    samples: int
++    ess: float
++    layouts: list
++    layout_weights: list = None
++    consistent: bool = True
++    exact: bool = False
++
++
++def test_reweight_respects_valid_layouts_and_masks_known_hits():
++    b = e.Board(size=4, fleet=[('Patrol', 2)])
++    # Two legal complete layouts, both containing cell 0 (a recorded hit).
++    b.grid[0] = e.HIT
++    masks = [(1 << 0) | (1 << 1), (1 << 0) | (1 << 4)]
++    sim = FakeSim(probs=[0]*16, counts=[0]*16, samples=2, ess=2, layouts=masks)
++    p = {'games': 10, 'gamma': (0.8, 0.0, 0.0)}
++    got, info = ol.reweight(b, sim, p)
++    assert got.probs[0] == 0.0
++    assert got.probs[1] + got.probs[4] == pytest.approx(1.0)
++    assert got.counts[0] == pytest.approx(2.0)
++    assert got.ess <= 2
++    assert sim.probs == [0]*16
++
++
++def test_weighted_samples_multiply_original_importance_weights():
++    b = e.Board(size=5, fleet=[('Patrol', 2)])
++    sim = FakeSim(probs=[0]*25, counts=[0]*25, samples=2, ess=1.6,
++                  layouts=[(1 << 0) | (1 << 1), (1 << 12) | (1 << 13)],
++                  layout_weights=[3.0, 1.0])
++    got, _ = ol.reweight(b, sim, {'games': 2, 'gamma': (0.0, 0.0, 0.0)})
++    assert got.probs[0] == pytest.approx(0.75)
++    assert got.probs[12] == pytest.approx(0.25)
++
++
++def test_history_save_and_loss_are_lossy_only_where_unknown(tmp_path, monkeypatch):
++    monkeypatch.setenv('BATTLESHIP_GAME_HISTORY', str(tmp_path / 'archive' / 'games.json'))
++    board = small_board()
++    board.grid[0] = e.HIT
++    board.grid[6] = e.MISS
++    saved = game_history.save({'opponent': 'Pat', 'outcome': 'lost'}, board)
++    assert saved['unknown'] == 23
++    assert saved['complete_layout'] is False
++    raw = game_history.all_games()[0]
++    assert raw['grid'][0] == e.HIT
++    assert raw['grid'][6] == e.MISS
++    assert raw['grid'][1] == e.UNKNOWN
++    assert sum(x != e.UNKNOWN for x in raw['grid']) == 2
++    assert game_history.get_game(saved['id']) == raw
++    assert len(game_history.list_games('Pat')) == 1
++    assert game_history.list_games('Other') == []
++
++
++def test_history_requires_valid_name_and_outcome(tmp_path, monkeypatch):
++    monkeypatch.setenv('BATTLESHIP_GAME_HISTORY', str(tmp_path / 'games.json'))
++    board = small_board()
++    board.grid[0] = e.MISS
++    for bad in ('', '  ', 'x'*65, '\n'):  # names must be usable as profile keys
++        with pytest.raises(ValueError):
++            game_history.save({'opponent': bad, 'outcome': 'lost'}, board)
++    with pytest.raises(ValueError):
++        game_history.save({'opponent': 'Pat', 'outcome': 'win'}, board)
++    empty = small_board()
++    with pytest.raises(ValueError):
++        game_history.save({'opponent': 'Pat', 'outcome': 'won'}, empty)
++
++
++def test_win_without_fully_marked_ships_remains_censored(tmp_path, monkeypatch):
++    monkeypatch.setenv('BATTLESHIP_GAME_HISTORY', str(tmp_path / 'games.json'))
++    board = small_board()
++    board.grid[0] = e.MISS
++    result = game_history.save({'opponent': 'Pat', 'outcome': 'won'}, board)
++    assert result['complete_layout'] is False
++    assert result['unknown'] == 24
++
++
++def test_saving_same_session_updates_not_double_counts(tmp_path, monkeypatch):
++    monkeypatch.setenv('BATTLESHIP_GAME_HISTORY', str(tmp_path / 'games.json'))
++    b = small_board()
++    b.grid[0] = e.MISS
++    first = game_history.save({'opponent': 'Pat', 'outcome': 'unfinished',
++                               'session_id': 'session-a'}, b)
++    b.grid[1] = e.HIT
++    second = game_history.save({'opponent': 'Pat', 'outcome': 'lost',
++                                'session_id': 'session-a'}, b)
++    assert first['id'] == second['id']
++    assert len(game_history.all_games()) == 1
++    assert second['observed'] == 2 and second['unknown'] == 23
++    assert game_history.get_game(second['id'])['grid'][2] == e.UNKNOWN
++
++
++def test_benchmark_uses_identical_hidden_fleet_for_baseline_and_bayesian(monkeypatch):
++    """Paired comparison must not silently generate different opponent fleets."""
++    from benchmarks import benchmark_opponent_learning as bench
++    fleet = [('A', 3), ('B', 2)]
++    layout = e.random_layout(5, fleet, random.Random(17), no_touch=False)
++    calls = []
++
++    def fake_layout(policy, size, fleet, no_touch, rng, steps):
++        return layout
++
++    def fake_play(observed_layout, size, fleet, no_touch, seed, samples, profile=None):
++        calls.append((observed_layout, seed, profile is not None))
++        return (20 if profile is None else 19, 10)
++
++    monkeypatch.setattr(bench.adversary, 'sample_layout', fake_layout)
++    monkeypatch.setattr(bench, 'play_one', fake_play)
++    result = bench.worker(('uniform', False, 5, fleet, 50, 300, 200, {'games': 1}))
++    assert result == ('uniform', 300, 20, 10, 19, 10)
++    assert len(calls) == 2
++    assert calls[0][0] is calls[1][0] and calls[0][1] == calls[1][1]
++    assert [c[2] for c in calls] == [False, True]
++
++
++def test_synthetic_training_game_never_reveals_unshot_ship_cells():
++    from benchmarks import benchmark_opponent_learning as bench
++    fleet = [('A', 3), ('B', 2)]
++    layout = e.random_layout(6, fleet, random.Random(3), no_touch=False)
++    record = bench.make_observation(layout, 6, fleet, False, 5, random.Random(4))
++    assert record['outcome'] == 'lost'
++    assert record['grid'].count(e.UNKNOWN) == 31
++    assert all(x in (e.UNKNOWN, e.HIT, e.MISS) for x in record['grid'])
+diff --git a/docs/OPPONENT_LEARNING.md b/docs/OPPONENT_LEARNING.md
+new file mode 100644
+--- /dev/null
++++ b/docs/OPPONENT_LEARNING.md
+@@ -0,0 +1,89 @@
++# Bayesian opponent memory — experimental
++
++This phase does **not** change `adversary.py`, `benchmarks/adversary_search.py`,
++`engine.py`, or the existing `control` strategy. The historical adversarial search
++results in `runs/` remain frozen. The Bayesian option is opt-in in the dashboard.
++
++## Data: what a saved game means
++
++The UI asks for an opponent name and an outcome: **won**, **lost**, or
++**unfinished**. Only the board as observed at save time is stored. Squares are
++`UNKNOWN=0`, `MISS=1`, `HIT=2`, or `SUNK=3`. A lost game often has many UNKNOWN
++squares, and **NONE of them is converted to a miss or a hidden ship cell**. The
++archive cannot infer an enemy's full fleet from an incomplete match. Likewise,
++choosing "won" does not magically complete the grid if the user forgot to mark
++ship cells. Explicit observed information is all that is used for learning.
++
++History is opt-in and stored in `data/games.json` under the local project folder,
++not in the browser's current-board storage and not on a cloud service. `data/` is
++ignored by Git. Back it up yourself if you want it to survive reinstallations.
++The API offers `GET /api/games` (saved-game metadata), `GET /api/games/<id>`
++(the exact saved observation), and `POST /api/games` (save a snapshot). The local
++server has **no login/authentication**: keep it bound to the default 127.0.0.1,
++not publicly exposed on the network, when saving personal opponent names.
++
++## Model
++
++1. For each matching opponent **and** identical board, fleet, and no-touch rule,
++   estimate the hit rate of *observed* squares in three zones: edge, inner ring,
++   and center. Unknown squares contribute nothing. HIT and SUNK both count as
++   observed ship cells. MISS counts as observed water.
++2. Anchor each zone to its uniform-legal-fleet occupancy frequency, estimated
++   reproducibly using `engine.random_layout`. Use a Beta prior equivalent to 120
++   observed cells per zone to prevent small histories causing extreme beliefs.
++3. Calculate each zone's posterior log-odds shift relative to uniform and cap
++   its magnitude at 1.0. Every complete sampled legal fleet receives a weight
++   proportional to `exp(sum(zone_log_odds * occupied_ship_cells_in_zone))`.
++4. Multiply the **existing importance weights** when the engine uses weighted
++   sampling. If the resulting ESS drops too far, temper the opponent prior.
++   Recompute normalized cell probabilities while masking already-known squares.
++5. Feed these probabilities into the existing checkerboard/target selection.
++   If no games match, the Bayesian mode calls the uniform solver unchanged.
++
++This is a **regularized approximate Bayesian model**, not an exact hierarchical
++posterior over the adversary's fleet-level feature weights. In particular, shot
++selection is adaptive in real games: frequently observing selected high-probability
++cells can bias region hit-rate estimates. A recorded set of random exploratory
++shots is more statistically representative. Evaluate carefully before promoting
++this prior to the default.
++
++## Paired benchmark
++
++```bash
++python benchmarks/benchmark_opponent_learning.py \
++  --games 100 --history-games 20 --train-observations 40 \
++  --samples 1000 --jobs 8 --out runs/opponent_learning.md
++
++# Independent experiment with no-touch rules
++python benchmarks/benchmark_opponent_learning.py \
++  --no-touch --games 100 --history-games 20 --jobs 8 \
++  --out runs/opponent_learning_no_touch.md
++```
++
++The benchmark uses the **frozen** `adversary.sample_layout` as the generator for:
++uniform placement, edge-hugging, spread-out, and the previously published CEM
++best weights under the selected rules. It does not rerun or modify CEM search.
++
++For each opponent policy, train the Bayesian model on one set of game seeds.
++The histories are **partially observed synthetic games**: a configurable number
++of random squares are revealed, not entire hidden fleets. The held-out game
++seeds are disjoint. Both solvers receive identical enemy fleets, identical
++random-number seeds for their Monte Carlo sampler until decisions diverge, and
++an identical sampling budget. Reports contain mean shots and paired 95% CIs.
++
++These synthetic histories are a controlled first test, not proof of real-person
++generalization. Follow-up tests should include realistic trajectories with
++missing-not-at-random observations, opponents who switch strategies, fewer
++past games, and probability calibration as well as average shots.
++
++## Scope / next steps
++
++- Do **not** retrain or change the frozen adversarial generator just to improve the
++  Bayesian model's scores.
++- Include cold-start and zero-history results; check the learned prior does not
++  severely degrade against uniform fleets.
++- Evaluate performance versus amount of history, calibration, ESS, and run time.
++- Test server save/load behavior and inspect saved losses to ensure no full fleet
++  was inferred from UNKNOWN squares.
++- Keep `control` as the dashboard default until independent evaluation justifies
++  changing it.

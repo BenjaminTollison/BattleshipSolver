@@ -33,5 +33,24 @@ def test_dashboard_strategy_selector_defaults_to_baseline():
     values = re.findall(r'<option value="([^"]+)"( selected)?', select)
     assert values[0] == ("control", " selected")
     assert sum(1 for _, sel in values if sel) == 1
+    assert any(value == "bayesian" for value, _ in values)
     for value, _ in values:
-        S.make(value)                            # every option is a valid strategy
+        # Bayesian is an opt-in API route handled by server.analyze(), not an
+        # entry in the frozen strategies.REGISTRY.
+        if value != "bayesian":
+            S.make(value)
+
+
+def test_dashboard_bayesian_option_is_routed_by_server(monkeypatch, tmp_path):
+    import server
+
+    # A zero-history profile must work and must not read the user's actual
+    # locally saved games during a test.
+    monkeypatch.setenv("BATTLESHIP_GAME_HISTORY", str(tmp_path / "games.json"))
+    result = server.analyze({
+        "strategy": "bayesian", "opponent": "Contract test opponent",
+        "size": 4, "fleet": [["Patrol", 2]], "samples": 200,
+    })
+    assert result["strategy"] == "bayesian"
+    assert result["opponent_profile"]["games"] == 0
+    assert result["rec"]["best"] is not None

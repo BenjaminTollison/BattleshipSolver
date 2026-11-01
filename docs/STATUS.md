@@ -13,6 +13,9 @@ not a claim that the experiments will outperform a human opponent.
   Historical sequential sampling is retained for benchmarking, not as a default.
 - **Default policy:** `control` (auto + checkerboard hunting + best-probability
   target selection); deliberately unchanged.
+- **Opponent learning (experimental):** separate Bayesian regional occupancy priors
+  learned from opt-in, partially observed saved games. Frozen adversarial placement
+  code and published reports remain untouched. See [OPPONENT_LEARNING.md](OPPONENT_LEARNING.md).
 - **Alternatives:** adaptive checkerboard, expected-hits lookahead,
   outcome-aware rollout targeting, and adaptive Monte Carlo sampling are
   available as experiments, not unconditional upgrades.

@@ -16,6 +16,8 @@ from pathlib import Path
 
 import engine
 import strategies
+import game_history
+import opponent_learning
 
 HERE = Path(__file__).resolve().parent
 
@@ -66,13 +68,33 @@ def analyze(payload):
     spec = payload.get("strategy", "control")
     if not isinstance(spec, str):
         raise ValueError("strategy must be a string")
-    strat = strategies.make(spec)            # raises ValueError for unknown specs
-    if strat.name == "control":
-        # Baseline: unchanged recommendation path.
-        sim = engine.simulate(board, samples, method=method)
-        rec = engine.recommend(board, sim, use_parity=use_parity)
+    profile_info = None
+    if spec == "bayesian":
+        # Separate, opt-in opponent-conditioned path. All other strategies,
+        # including the frozen control and adversarial generator, are unchanged.
+        opponent = game_history.normalize_opponent(payload.get("opponent", ""))
+        profile = opponent_learning.fit_profile(game_history.all_games(), opponent,
+                                                board.size, board.fleet, board.no_touch)
+        sim, rec, weighting = opponent_learning.recommend(
+            board, samples, profile, use_parity=use_parity, method=method)
+        strategy_name = "bayesian"
+        profile_info = {"opponent": opponent, "games": profile["games"],
+                        "observed": profile["observed"],
+                        "effective_samples": round(weighting["ess"], 1),
+                        "tempering": weighting["tempering"]}
+        if profile["games"] == 0:
+            rec["reason"] = "No matching saved games: using the uniform baseline. " + rec["reason"]
+        else:
+            rec["reason"] = f"Bayesian opponent profile ({profile['games']} saved games). " + rec["reason"]
     else:
-        sim, rec = _strategy_recommendation(board, strat, samples, method, use_parity)
+        strat = strategies.make(spec)            # raises ValueError for unknown specs
+        strategy_name = strat.label()
+        if strat.name == "control":
+            # Baseline: unchanged recommendation path.
+            sim = engine.simulate(board, samples, method=method)
+            rec = engine.recommend(board, sim, use_parity=use_parity)
+        else:
+            sim, rec = _strategy_recommendation(board, strat, samples, method, use_parity)
     warnings = board.warnings()
     if not sim.consistent and board.remaining_ships():
         if sim.proven:
@@ -95,7 +117,8 @@ def analyze(payload):
         "proven": sim.proven,
         "total_layouts": sim.total_layouts,
         "rec": rec,
-        "strategy": strat.label(),
+        "strategy": strategy_name,
+        "opponent_profile": profile_info,
         "remaining": board.remaining_ships(),
         "warnings": warnings,
     }
@@ -148,17 +171,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/index.html"):
             self._send(200, (HERE / "dashboard.html").read_bytes(), "text/html; charset=utf-8")
+        elif self.path == "/api/games":
+            self._send(200, {"games": game_history.list_games()})
+        elif self.path.startswith("/api/games/"):
+            game = game_history.get_game(self.path[len("/api/games/"):])
+            self._send(200, game) if game is not None else self._send(404, {"error": "not found"})
         else:
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
         try:
             n = int(self.headers.get("Content-Length", 0))
+            if not 0 <= n <= 128_000:
+                self._send(413, {"error": "request too large"})
+                return
             payload = json.loads(self.rfile.read(n) or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be an object")
             if self.path == "/api/analyze":
                 self._send(200, analyze(payload))
             elif self.path == "/api/sink":
                 self._send(200, sink(payload))
+            elif self.path == "/api/games":
+                self._send(200, game_history.save(payload, board_from(payload)))
             else:
                 self._send(404, {"error": "not found"})
         except Exception as exc:                       # report errors to the UI

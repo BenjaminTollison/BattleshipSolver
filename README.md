@@ -81,12 +81,30 @@ Benchmark runs include a configuration fingerprint so incompatible results
 cannot be silently resumed. Read [testing details](docs/TESTING.md) before
 changing the sampler or interpreting statistical differences.
 
+## Opponent memory (experimental)
+
+Enter an opponent name under **Opponent memory and saved games** in the dashboard.
+Choose **Won**, **Lost**, or **Unfinished**, then save the observed board. You can
+reload it later. **Unknown squares in a lost game stay unknown**: the tool never
+fabricates hidden ship positions. Games remain in local `data/games.json` (ignored
+by Git). Profiles are separated by opponent, board, fleet and touching rule.
+The new **Bayesian** strategy reweights legal fleets based on observed placement
+preferences. It remains experimental and is not known to outperform the control.
+See [opponent-learning details](docs/OPPONENT_LEARNING.md).
+
+```bash
+python benchmarks/benchmark_opponent_learning.py --games 100 --history-games 20 \
+  --samples 1000 --jobs 8 --out runs/opponent_learning.md
+```
+
 ## Repository map
 
 | Location | Purpose |
 |---|---|
 | `engine.py` | Fleet rules, placement probabilities, recommendations |
 | `strategies.py` | Baseline and experimental shot-selection policies |
+| `opponent_learning.py`, `game_history.py` | Bayesian placement prior and local game archive |
+| `benchmarks/benchmark_opponent_learning.py` | Paired uniform/adversarial opponent-learning test |
 | `server.py`, `dashboard.html` | Local API and interactive dashboard |
 | `tests/`, `test_engine.py` | Regression and statistical tests |
 | `benchmarks/` | Sampling and paired self-play runners; adversarial placement search |

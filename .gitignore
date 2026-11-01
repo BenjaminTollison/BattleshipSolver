@@ -9,3 +9,6 @@ runs/*.md
 runs/*.csv
 runs/*.csv.meta.json
 runs/*.json
+
+# Opt-in local opponent game archive (never commit personal history).
+data/

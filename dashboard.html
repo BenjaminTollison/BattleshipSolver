@@ -268,6 +268,7 @@
           <label>Shot selection
             <select id="strategy">
               <option value="control" selected>Baseline: checkerboard + best square</option>
+              <option value="bayesian">Bayesian: learn from saved opponent games</option>
               <optgroup label="Experimental (not shown to beat the baseline)">
                 <option value="adaptive_parity">Adaptive checkerboard</option>
                 <option value="lookahead_target">Lookahead targeting</option>
@@ -287,6 +288,32 @@
         <button id="newgame">New game</button>
       </div>
     </div>
+    <div class="card" id="games-card">
+      <h2>Opponent memory and saved games</h2>
+      <label>Opponent name <input id="opponent" type="text" maxlength="64"
+        placeholder="Enter a name to keep histories separate"></label>
+      <div class="note">Saved games stay on this computer. A loss can be saved with
+        missing ship positions; unplayed squares remain unknown and are never
+        counted as water. The Bayesian policy learns only from observed squares.</div>
+      <div class="row" style="margin-top:10px">
+        <label>Result
+          <select id="game-outcome">
+            <option value="unfinished" selected>Unfinished / stopped</option>
+            <option value="won">Won</option>
+            <option value="lost">Lost — remaining ships unknown</option>
+          </select>
+        </label>
+        <button class="primary" id="save-game">Save current game</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <label style="flex:1">Previously saved games
+          <select id="saved-games" style="max-width:100%;width:100%"></select>
+        </label>
+        <button id="load-game">Load</button>
+        <button id="refresh-games">Refresh</button>
+      </div>
+      <div class="note" id="games-msg" role="status"></div>
+    </div>
   </section>
 </main>
 <div class="tooltip" id="tip"></div>
@@ -304,7 +331,9 @@ let tool = 1, result = null, busy = false, pending = false, history = [];
 
 function freshState(size) {
   return { size, grid: Array(size*size).fill(0), fleet: STD_FLEET.map(x => [...x]),
-           sunk: [], lastHit: null, log: [] };
+           sunk: [], lastHit: null, log: [],
+           session_id: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() :
+             Date.now().toString(36) + "-" + Math.random().toString(36).slice(2) };
 }
 const name = i => ROWS[Math.floor(i / S.size)] + (i % S.size + 1);
 
@@ -330,7 +359,8 @@ function changed() { save(); renderBoard(); renderFleet(); renderHistory(); anal
 async function api(path, extra) {
   const body = { size: S.size, grid: S.grid, fleet: S.fleet, sunk: S.sunk,
                  no_touch: $("notouch").checked, parity: $("parity").checked,
-                 samples: +$("samples").value, strategy: $("strategy").value, ...extra };
+                 samples: +$("samples").value, strategy: $("strategy").value,
+                 opponent: $("opponent").value.trim(), session_id: S.session_id, ...extra };
   const r = await fetch(path, { method: "POST", headers: {"Content-Type":"application/json"},
                                 body: JSON.stringify(body) });
   const j = await r.json();
@@ -578,7 +608,68 @@ $("newgame").onclick = () => {
 };
 $("size").onchange = $("newgame").onclick;
 
+// -------- opt-in, local game archive --------
+async function refreshGames() {
+  const select = $("saved-games");
+  const wanted = select.value;
+  const response = await fetch("/api/games", {cache: "no-store"});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || response.statusText);
+  const current = $("opponent").value.trim();
+  select.replaceChildren();
+  const filtered = (data.games || []).filter(g => !current || g.opponent === current);
+  for (const g of filtered) {
+    const option = document.createElement("option");
+    option.value = g.id;
+    option.textContent = `${g.opponent} · ${g.outcome} · ${g.observed} observed / ${g.unknown} unknown · ${g.saved_at.slice(0, 10)}`;
+    select.appendChild(option);
+  }
+  if ([...select.options].some(o => o.value === wanted)) select.value = wanted;
+  if (!filtered.length) $("games-msg").textContent = "No saved games for this opponent yet.";
+}
+$("opponent").addEventListener("change", () => {
+  try { localStorage.setItem("bs-opponent", $("opponent").value); } catch (e) {}
+  refreshGames().catch(e => $("games-msg").textContent = e.message);
+  if ($("strategy").value === "bayesian") analyze();
+});
+$("save-game").onclick = async () => {
+  if (!$("opponent").value.trim()) {
+    $("games-msg").textContent = "Enter an opponent name first."; return;
+  }
+  try {
+    const saved = await api("/api/games", {outcome: $("game-outcome").value});
+    $("games-msg").textContent = `Saved ${saved.outcome}: ${saved.observed} observed; ${saved.unknown} unknown. No hidden locations were invented.`;
+    await refreshGames();
+    if ($("strategy").value === "bayesian") analyze();
+  } catch (e) { $("games-msg").textContent = "Save failed: " + e.message; }
+};
+$("refresh-games").onclick = () => refreshGames().catch(e => $("games-msg").textContent = e.message);
+$("load-game").onclick = async () => {
+  const id = $("saved-games").value;
+  if (!id) { $("games-msg").textContent = "Choose a saved game."; return; }
+  if (!confirm("Replace the current board with this saved observation?")) return;
+  try {
+    const response = await fetch("/api/games/" + encodeURIComponent(id));
+    const game = await response.json();
+    if (!response.ok) throw new Error(game.error || response.statusText);
+    snapshot();
+    S = freshState(game.size);
+    S.grid = [...game.grid]; S.fleet = game.fleet.map(x => [...x]);
+    S.sunk = [...game.sunk]; S.session_id = game.session_id || S.session_id;
+    S.log = [`Loaded saved ${game.outcome} game (move order not reconstructed)`];
+    $("size").value = String(game.size);
+    $("notouch").checked = !!game.no_touch;
+    $("opponent").value = game.opponent;
+    editFleet = null;
+    changed();
+    $("games-msg").textContent = `Loaded: ${game.unknown} squares still unknown.`;
+  } catch (e) { $("games-msg").textContent = "Load failed: " + e.message; }
+};
+try { $("opponent").value = localStorage.getItem("bs-opponent") || ""; } catch (e) {}
+refreshGames().catch(e => $("games-msg").textContent = e.message);
+
 load();
+if (!S.session_id) S.session_id = freshState(S.size).session_id;
 $("size").value = S.size;
 changed();
 </script>
