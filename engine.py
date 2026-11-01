@@ -272,6 +272,8 @@ class SimResult:
     proven: bool = False   # `consistent` is a proof (exact enumeration completed)
     total_layouts: float = 0.0   # exact count (exact) or unbiased estimate (weighted)
     layouts: list = None         # keep_layouts=True: occupancy bitmask of each layout
+    ship_layouts: list = None    # keep_ships=True: per layout, one placement mask per ship
+    ship_names: list = None      # ...in this ship order (remaining ships, longest first)
     layout_weights: list = None  # matching importance weights (None = all equal)
 
 
@@ -303,6 +305,7 @@ class _Prep:
     size: int
     ncell: int
     ships: list            # remaining ship lengths, longest first
+    names: list            # matching ship names
     blocked: int
     hit_m: int
     no_touch: bool
@@ -333,20 +336,36 @@ def _prepare(board: Board) -> _Prep:
         for p in valid[L]:
             for i in p.cells:
                 fit_counts[i] += 1
-    return _Prep(size, ncell, ships, blocked, hit_m, board.no_touch,
+    names = [n for n, _ in sorted(board.remaining_ships(), key=lambda x: -x[1])]
+    return _Prep(size, ncell, ships, names, blocked, hit_m, board.no_touch,
                  valid, valid_by_cell, fit_counts)
+
+
+class _Keep:
+    """Collects sampled layouts (and optionally each ship's placement)."""
+
+    def __init__(self, ships=False):
+        self.ships = ships
+        self.layouts, self.weights, self.slots = [], [], []
+        self.weighted = False
+
+    def add(self, occupied, w=1.0, slots=None):
+        self.layouts.append(occupied)
+        self.weights.append(w)
+        if self.ships:
+            self.slots.append(tuple(slots))
 
 
 def _finish(board, prep, counts, samples, attempts, t0, method, *, ess=None,
             exact=False, proven=False, total=0.0, weight_sum=None, keep=None):
     """Turn raw occupancy tallies into a SimResult."""
     layouts = weights = None
+    ship_layouts = ship_names = None
     if keep is not None:
-        if keep and isinstance(keep[0], tuple):
-            layouts = [m for m, _ in keep]
-            weights = [w for _, w in keep]
-        else:
-            layouts = list(keep)
+        layouts = keep.layouts
+        weights = keep.weights if keep.weighted else None
+        if keep.ships:
+            ship_layouts, ship_names = keep.slots, list(prep.names)
     if weight_sum is not None:                       # weighted tallies
         probs = [c / weight_sum for c in counts] if weight_sum > 0 else [0.0] * prep.ncell
         counts = [p * samples for p in probs]
@@ -359,7 +378,8 @@ def _finish(board, prep, counts, samples, attempts, t0, method, *, ess=None,
                      prep.fit_counts, samples > 0, method=method,
                      ess=float(samples if ess is None else ess), exact=exact,
                      proven=proven, total_layouts=float(total),
-                     layouts=layouts, layout_weights=weights)
+                     layouts=layouts, layout_weights=weights,
+                     ship_layouts=ship_layouts, ship_names=ship_names)
 
 
 # ---- exact i.i.d. rejection sampling -------------------------------------- #
@@ -374,11 +394,13 @@ def _rejection(prep, n_samples, rng, deadline, max_proposals, counts=None,
         return counts, accepted, proposals
     pools = [(m, h, len(m)) for m, h in pools]
     hit_m, no_touch, rr = prep.hit_m, prep.no_touch, rng.randrange
+    track = keep is not None and keep.ships
     while accepted < n_samples and proposals < max_proposals:
         proposals += 1
         if proposals % 4096 == 0 and time.time() > deadline:
             break
         occupied = forbid = 0
+        chosen = [] if track else None
         for masks, halos, n in pools:
             k = rr(n)
             m = masks[k]
@@ -386,12 +408,14 @@ def _rejection(prep, n_samples, rng, deadline, max_proposals, counts=None,
                 break
             occupied |= m
             forbid |= halos[k] if no_touch else m
+            if track:
+                chosen.append(m)
         else:
             if hit_m & ~occupied:
                 continue
             accepted += 1
             if keep is not None:
-                keep.append(occupied)
+                keep.add(occupied, 1.0, chosen)
             for i in _bits(occupied):
                 counts[i] += 1
     return counts, accepted, proposals
@@ -441,6 +465,7 @@ def _weighted(prep, n_samples, rng, deadline, max_particles, weighted=True, keep
             break
         unplaced = list(range(k))
         occupied = forbid = 0
+        slots = [0] * k
         w = 1.0
         while unplaced:
             opts, _ = _options(prep, unplaced, occupied, forbid)
@@ -449,6 +474,7 @@ def _weighted(prep, n_samples, rng, deadline, max_particles, weighted=True, keep
                 break
             w *= len(opts)
             s, p = opts[rng.randrange(len(opts))]
+            slots[s] = p.mask
             unplaced.remove(s)
             occupied |= p.mask
             forbid |= p.halo if no_touch else p.mask
@@ -460,7 +486,8 @@ def _weighted(prep, n_samples, rng, deadline, max_particles, weighted=True, keep
         wsum += w
         wsq += w * w
         if keep is not None:
-            keep.append((occupied, w))
+            keep.weighted = True
+            keep.add(occupied, w, slots)
         for i in _bits(occupied):
             counts[i] += w
     ess = (wsum * wsum / wsq) if wsq else 0.0
@@ -480,33 +507,44 @@ def _enumerate(prep, node_cap, keep=None):
     total = [0]
     no_touch = prep.no_touch
 
-    def dfs(unplaced, occupied, forbid):
+    track = keep is not None and keep.ships
+
+    def dfs(unplaced, occupied, forbid, slots):
         nodes[0] += 1
         if nodes[0] > node_cap:
             raise _NodeCap
         opts, _ = _options(prep, unplaced, occupied, forbid)
         if len(unplaced) == 1:
             # Leaf level: aggregate instead of recursing.
-            good = [p for _, p in opts if not prep.hit_m & ~(occupied | p.mask)]
+            good = [(s, p) for s, p in opts if not prep.hit_m & ~(occupied | p.mask)]
             if not good:
                 return
             n = len(good)
             total[0] += n
             for i in _bits(occupied):
                 counts[i] += n
-            for p in good:
+            for s, p in good:
                 if keep is not None:
-                    keep.append(occupied | p.mask)
+                    if track:
+                        leaf = list(slots)
+                        leaf[s] = p.mask
+                        keep.add(occupied | p.mask, 1.0, leaf)
+                    else:
+                        keep.add(occupied | p.mask)
                 for i in p.cells:
                     counts[i] += 1
             nodes[0] += n
             return
         for s, p in opts:
             rest = [x for x in unplaced if x != s]
-            dfs(rest, occupied | p.mask, forbid | (p.halo if no_touch else p.mask))
+            nxt = slots
+            if track:
+                nxt = list(slots)
+                nxt[s] = p.mask
+            dfs(rest, occupied | p.mask, forbid | (p.halo if no_touch else p.mask), nxt)
 
     if prep.ships:
-        dfs(list(range(len(prep.ships))), 0, 0)
+        dfs(list(range(len(prep.ships))), 0, 0, [0] * len(prep.ships))
     return counts, total[0], nodes[0]
 
 
@@ -565,7 +603,7 @@ def _sequential_legacy(prep, n_samples, rng, deadline):
 def simulate(board: Board, n_samples: int = 20000, seed=None,
              time_limit: float = 8.0, method: str = "auto",
              exact_node_cap: int = AUTO_EXACT_NODE_CAP,
-             keep_layouts: bool = False) -> SimResult:
+             keep_layouts: bool = False, keep_ships: bool = False) -> SimResult:
     """
     Estimate, for every square, the probability that a remaining ship occupies
     it, under a uniform distribution over all complete layouts consistent with
@@ -574,14 +612,18 @@ def simulate(board: Board, n_samples: int = 20000, seed=None,
     keep_layouts=True also returns every sampled/enumerated layout as a bitmask
     (`SimResult.layouts`, with `layout_weights` for weighted sampling), which
     lets strategies condition on hypothetical shot outcomes (lookahead).
+    keep_ships=True (implies keep_layouts) also returns each ship's placement
+    (`SimResult.ship_layouts`, ships named by `ship_names`), so a strategy can
+    model which ship a hit belongs to and when a ship would be announced sunk.
     """
+    keep_layouts = keep_layouts or keep_ships
     if method not in SAMPLING_METHODS:
         raise ValueError(f"method must be one of {SAMPLING_METHODS}")
     rng = random.Random(seed)
     t0 = time.time()
     deadline = t0 + time_limit
     prep = _prepare(board)
-    keep = [] if keep_layouts else None
+    keep = _Keep(keep_ships) if keep_layouts else None
 
     if not prep.ships:
         # Nothing left to place: consistent iff no open hits remain.
@@ -625,14 +667,14 @@ def simulate(board: Board, n_samples: int = 20000, seed=None,
                 return _finish_rejection(board, prep, counts, acc, att, t0, keep)
     # 2. Small layout space -> enumerate exactly (also proves infeasibility).
     try:
-        keep = [] if keep_layouts else None
+        keep = _Keep(keep_ships) if keep_layouts else None
         counts, total, nodes = _enumerate(prep, exact_node_cap, keep)
         return _finish(board, prep, counts, total, nodes, t0, "exact",
                        exact=True, proven=True, total=total, keep=keep)
     except _NodeCap:
         pass
     # 3. Large, constrained space -> weighted importance sampling.
-    keep = [] if keep_layouts else None
+    keep = _Keep(keep_ships) if keep_layouts else None
     return _run_weighted(board, prep, n_samples, rng, deadline, t0, keep)
 
 

@@ -158,3 +158,41 @@ def test_analyze_proves_impossible_board():
     response = server.analyze({'size': 4, 'fleet': [['A', 2]], 'grid': grid, 'samples': 200})
     assert not response['consistent'] and response['proven']
     assert 'checked exhaustively' in response['warnings'][0]
+
+
+def test_analyze_baseline_strategy_is_the_default_path(monkeypatch):
+    real = e.simulate
+    monkeypatch.setattr(server.engine, 'simulate',
+                        lambda *a, **k: real(*a, **{**k, 'seed': 1}))  # deterministic
+    payload = {'size': 10, 'grid': [0] * 100, 'samples': 1000}
+    payload['grid'][44] = e.HIT
+    default = server.analyze(payload)
+    explicit = server.analyze({**payload, 'strategy': 'control'})
+    assert default['strategy'] == explicit['strategy'] == 'control'
+    assert default['probs'] == explicit['probs']
+    sim = real(server.board_from(payload), 1000, seed=1)
+    assert default['probs'] == sim.probs
+    assert default['rec']['best'] == e.recommend(server.board_from(payload), sim)['best']
+
+
+@pytest.mark.parametrize('spec', ['adaptive_parity', 'lookahead_target', 'rollout_target',
+                                  'adaptive_mc', 'adaptive_mc:eps=0.01'])
+def test_analyze_runs_experimental_strategies(spec):
+    payload = {'size': 10, 'grid': [0] * 100, 'samples': 1000, 'strategy': spec}
+    payload['grid'][44] = e.HIT
+    payload['grid'][45] = e.MISS
+    response = server.analyze(payload)
+    best = response['rec']['best']
+    assert response['strategy'] == spec and 'experimental' in response['rec']['reason']
+    assert payload['grid'][best] == e.UNKNOWN
+    assert response['rec']['ranked'][0]['idx'] == best
+    json.dumps(response)                         # serialisable (no layout lists)
+
+
+def test_analyze_rejects_unknown_strategy():
+    with pytest.raises(ValueError):
+        server.analyze({'size': 10, 'grid': [0] * 100, 'strategy': 'cheat'})
+
+
+def test_analyze_allows_the_dashboards_largest_sample_option():
+    assert server.MAX_SAMPLES == 500_000

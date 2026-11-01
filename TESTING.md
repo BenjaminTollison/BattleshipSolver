@@ -68,14 +68,42 @@ scattered hits, no-touch, duplicate ship lengths, and a late-game position.
 ## Strategy experiments (`tests/test_strategies.py`)
 
 * The control replays `engine.play_game` exactly. This guarantees the strategy
-  benchmark's control matches `benchmark_1600.md`.
+  benchmark's control matches `benchmark_1600.md`; it was also checked against the
+  committed `strategy_games.csv`.
 * Adaptive checkerboard: it leaves the grid only beyond `margin`; `margin=∞` gives
   the control and a negative margin gives greedy. Target mode is unchanged.
-* Lookahead: the 2-shot expected-hits value matches brute force on a small board;
-  depth 1 is greedy; hunting is identical to the control.
-* Adaptive Monte Carlo: the expected-loss formula is checked, the standard error of
-  the gap matches the direct formula, pooled samples stay unbiased (for both
-  rejection and weighted sampling), it draws no extra samples for exact or clear
-  decisions, and it samples up to the cap on close calls.
-* Harness: strategy names with parameters are validated, games are deterministic,
-  and the report's paired differences are checked.
+* Lookahead: the 2-shot expected-hits value matches brute force; depth 1 is greedy;
+  hunting is identical to the control.
+* Outcome-aware targeting: outcomes are miss, hit, or a named sink; expected misses
+  match a hand calculation (1.5 for a 2-long ship around a single hit); the chosen
+  square minimises the exact expected misses; weighted resampling reproduces the
+  heat map; hunting is identical to the control.
+* Adaptive Monte Carlo: the expected-loss formula is checked; the standard error and
+  covariance match direct computation; joint-distribution regret agrees with the
+  two-candidate closed form; competing checkerboard classes count only until the
+  class is locked; pooled samples stay unbiased; no extra sampling for exact or
+  clear decisions; the refined heat map and its ESS are exposed.
+* Specs: canonical names are complete and order-independent and round-trip; bad
+  specs are rejected; games are deterministic.
+
+## Benchmark provenance (`tests/test_benchmark_provenance.py`)
+
+* The config id changes with the sample budget, rules, sampling method and code
+  fingerprint.
+* A CSV is rejected, never reused, if any of its rows came from another
+  configuration, including mixed files and old CSVs without config ids. The error
+  names the field that differs.
+* The report uses only the requested fleet range. `--family-size` widens the
+  Bonferroni interval. Runs on the development fleets get a held-out-validation
+  reminder.
+* Progress bar format; the sweep preset is valid (14 experiments); an end-to-end run
+  resumes without replaying games and refuses a changed `--samples`.
+
+## Server and dashboard
+
+* The baseline is the default and goes through the unchanged recommendation path.
+  Every experimental strategy can be selected; unknown strategies are rejected;
+  responses stay JSON-serialisable. The sample cap matches the dashboard's 500,000
+  option.
+* Dashboard: the strategy selector defaults to Baseline, and every option is a valid
+  strategy spec.

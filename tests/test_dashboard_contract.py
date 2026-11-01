@@ -22,3 +22,16 @@ def test_dashboard_persists_state_and_calls_real_api():
     assert '/api/sink' in HTML
     assert 'function undo()' in HTML
     assert 'function runCommands()' in HTML
+
+
+def test_dashboard_strategy_selector_defaults_to_baseline():
+    import re
+    import strategies as S
+    assert 'id="strategy"' in HTML and 'strategy: $("strategy").value' in HTML
+    select = HTML[HTML.index('<select id="strategy">'):]
+    select = select[:select.index('</select>')]
+    values = re.findall(r'<option value="([^"]+)"( selected)?', select)
+    assert values[0] == ("control", " selected")
+    assert sum(1 for _, sel in values if sel) == 1
+    for value, _ in values:
+        S.make(value)                            # every option is a valid strategy

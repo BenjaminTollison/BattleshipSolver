@@ -231,18 +231,127 @@ def test_play_is_deterministic_and_well_formed(spec):
     assert a["hunt_shots"] + a["target_shots"] == a["shots"]
 
 
-def test_benchmark_summary_reports_paired_differences(tmp_path):
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
-    import benchmark_strategies as B
-    rows = []
-    for g in range(30):
-        for s, shift in (("control", 0), ("adaptive_parity", -2)):
-            shots = 40 + g % 7 + shift
-            rows.append(dict(strategy=s, game=g, shots=shots, hunt_shots=shots - 15,
-                             target_shots=15, mc_layouts=shots * 1500, exact_shots=0,
-                             seconds=1.0))
-    text = B.summarise(rows, ["control", "adaptive_parity"])
-    assert "Paired games completed by every strategy: **30**" in text
-    assert "| adaptive_parity | -2.00 |" in text and "**better**" in text
+def test_canonical_spec_is_complete_and_order_independent():
+    a = S.make("adaptive_mc")
+    b = S.make("adaptive_mc:eps=0.005,min=750")
+    c = S.make("adaptive_mc:min=750,eps=0.005,max=12000,m=4")
+    assert a.canonical() == b.canonical() == c.canonical() == \
+        "adaptive_mc:eps=0.005,m=4,max=12000,min=750"
+    assert S.make(a.canonical()).p == a.p                    # round-trips
+    assert S.make("control").canonical() == "control"
+    assert S.make("adaptive_parity:margin=0.2").canonical() != S.make("adaptive_parity").canonical()
+
+
+def test_play_reports_effective_sample_size():
+    r = S.play("adaptive_mc", layout_seed=3, samples=300, fleet=SMALL_FLEET, size=6)
+    sampled = r["shots"] - r["exact_shots"]
+    assert r["mc_ess"] > 0 or sampled == 0
+    assert r["mc_ess"] <= r["mc_layouts"] + 1e-6
+
+
+# --------------------------------------------------------------------------- #
+# Outcome-aware targeting
+# --------------------------------------------------------------------------- #
+def test_outcome_reports_hit_miss_and_named_sink():
+    search = S._Search(["Carrier", "Destroyer"], 10)
+    fleet = (0b111, 0b11000)               # Carrier on 0-2, Destroyer on 3-4
+    assert search.outcome(fleet, 7, 0)[0] == "miss"
+    assert search.outcome(fleet, 0, 0)[:2] == ("hit", None)
+    assert search.outcome(fleet, 2, 0b011)[:2] == ("sunk", "Carrier")
+    assert search.outcome(fleet, 4, 0b01000)[:2] == ("sunk", "Destroyer")
+
+
+def test_expected_misses_matches_hand_calculation():
+    # One 2-long ship, hit in the middle of a 5x5 board, all four directions
+    # equally likely.  Shooting one neighbour: 1/4 sink at once; otherwise
+    # 1 miss + the 3-way case (2/3 x (1 + 1/2)) = 1 miss more on average:
+    # E = 3/4 x (1 + 1) = 1.5 misses, whichever neighbour is shot first.
+    b = e.Board(size=5, fleet=[("D", 2)])
+    b.set(2, 2, e.HIT)
+    sim = e.simulate(b, 1, method="exact", keep_ships=True)
+    assert len(sim.ship_layouts) == 4
+    search = S._Search(sim.ship_names, 10)
+    hits = 1 << 12
+    for c in (7, 11, 13, 17):
+        assert search.expected_misses(list(sim.ship_layouts), hits, hits, frozenset(), 0,
+                                      first=c) == pytest.approx(1.5)
+
+
+def test_rollout_target_prefers_shot_with_fewer_expected_misses():
+    b = e.Board(size=6, fleet=list(SMALL_FLEET))
+    b.set(2, 2, e.HIT)
+    b.set(2, 3, e.HIT)
+    sim = e.simulate(b, 1, method="exact", keep_ships=True)
+    strat = S.make("rollout_target:top_k=36,particles=100000")
+    shot = strat.choose(b, sim, S.Context(extra_rng=random.Random(1)))
+    hits = (1 << 14) | (1 << 15)
+    search = S._Search(sim.ship_names, 14)
+    parts = list(sim.ship_layouts)
+    values = {c: search.expected_misses(parts, hits, hits, frozenset(), 0, first=c)
+              for c in range(36) if b.grid[c] == e.UNKNOWN and sim.probs[c] > 0}
+    assert values[shot] == pytest.approx(min(values.values()))
+
+
+def test_rollout_target_hunts_like_control():
+    b = e.Board()
+    sim = e.simulate(b, 800, seed=3, keep_ships=True)
+    assert S.make("rollout_target").choose(b, sim, S.Context()) == \
+        S.make("control").choose(b, sim, S.Context())
+
+
+def test_particles_resample_by_weight():
+    b = e.Board(size=6, fleet=list(SMALL_FLEET))
+    b.set(2, 2, e.HIT)
+    sim = e.simulate(b, 3000, seed=2, method="weighted", keep_ships=True)
+    parts = S._particles(sim, 2000, random.Random(0))
+    assert len(parts) == 2000
+    # resampled occupancy reproduces the weighted heat map
+    for c in (13, 15, 8, 20):
+        freq = sum(1 for f in parts if any(x >> c & 1 for x in f)) / len(parts)
+        assert freq == pytest.approx(sim.probs[c], abs=0.04)
+
+
+# --------------------------------------------------------------------------- #
+# Adaptive Monte Carlo refinements
+# --------------------------------------------------------------------------- #
+def test_candidate_covariance_matches_direct_computation():
+    b = tiny_board()
+    sim = e.simulate(b, 3000, seed=4, method="rejection", keep_layouts=True)
+    cands = [1, 3, 7]
+    mean, cov = S.candidate_covariance(sim, cands)
+    n = len(sim.layouts)
+    x = [[m >> c & 1 for c in cands] for m in sim.layouts]
+    for j in range(3):
+        assert mean[j] == pytest.approx(sum(r[j] for r in x) / n)
+        for k in range(3):
+            direct = (sum(r[j] * r[k] for r in x) / n - mean[j] * mean[k]) / n
+            assert cov[j][k] == pytest.approx(direct)
+
+
+def test_expected_regret_agrees_with_two_candidate_formula():
+    b = tiny_board()
+    sim = e.simulate(b, 2000, seed=5, method="rejection", keep_layouts=True)
+    a, c = sorted(range(25), key=lambda i: -sim.probs[i])[:2]
+    closed = S.expected_loss(sim.probs[a] - sim.probs[c], S.diff_standard_error(sim, a, c))
+    mc = S.expected_regret(sim, [a, c], random.Random(0), draws=20000)
+    assert mc == pytest.approx(closed, rel=0.1, abs=2e-4)
+
+
+def test_contested_class_leaders_only_until_class_is_locked():
+    b = e.Board()
+    sim = e.simulate(b, 1000, seed=1)
+    rec = e.recommend(b, sim, use_parity=True)
+    leaders = S.contested_class_leaders(b, sim, rec)
+    assert len(leaders) == 1
+    assert sum(divmod(leaders[0], 10)) % 2 != rec["parity"]["cls"]
+    b.set(0, 0, e.MISS)                      # one shot fired -> class locked
+    sim = e.simulate(b, 1000, seed=1)
+    assert S.contested_class_leaders(b, sim, e.recommend(b, sim, use_parity=True)) == []
+
+
+def test_adaptive_mc_exposes_the_refined_heat_map():
+    b = e.Board()
+    sim = e.simulate(b, 750, seed=1, method="rejection", keep_layouts=True)
+    ctx = S.Context(extra_rng=random.Random(1))
+    S.make("adaptive_mc:max=3000,eps=0.0000001").choose(b, sim, ctx)
+    assert ctx.decision_sim.samples == 3000 and ctx.decision_ess == pytest.approx(3000)

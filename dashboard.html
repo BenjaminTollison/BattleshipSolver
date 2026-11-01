@@ -263,6 +263,25 @@
         <label class="chk"><input type="checkbox" id="notouch"> House rule: ships may not touch (not even diagonally)</label>
         <label class="chk"><input type="checkbox" id="showpct" checked> Show % on squares</label>
       </div>
+      <details style="margin-top:10px" id="strategy-box"><summary>Experimental strategies</summary>
+        <div style="margin-top:8px; display:grid; gap:6px">
+          <label>Shot selection
+            <select id="strategy">
+              <option value="control" selected>Baseline: checkerboard + best square</option>
+              <optgroup label="Experimental (not shown to beat the baseline)">
+                <option value="adaptive_parity">Adaptive checkerboard</option>
+                <option value="lookahead_target">Lookahead targeting</option>
+                <option value="rollout_target">Outcome-aware targeting</option>
+                <option value="adaptive_mc">Adaptive sampling</option>
+                <option value="adaptive_mc:eps=0.01">Adaptive sampling, fast mode</option>
+              </optgroup>
+            </select>
+          </label>
+          <div class="note">In 1,600 benchmark games none of these needed fewer shots than the
+            baseline. Adaptive sampling chooses its own sample size and ignores the
+            Simulations setting. See STRATEGIES.md.</div>
+        </div>
+      </details>
       <div class="row" style="margin-top:12px">
         <button id="rerun">Re-run simulation</button>
         <button id="newgame">New game</button>
@@ -311,7 +330,7 @@ function changed() { save(); renderBoard(); renderFleet(); renderHistory(); anal
 async function api(path, extra) {
   const body = { size: S.size, grid: S.grid, fleet: S.fleet, sunk: S.sunk,
                  no_touch: $("notouch").checked, parity: $("parity").checked,
-                 samples: +$("samples").value, ...extra };
+                 samples: +$("samples").value, strategy: $("strategy").value, ...extra };
   const r = await fetch(path, { method: "POST", headers: {"Content-Type":"application/json"},
                                 body: JSON.stringify(body) });
   const j = await r.json();
@@ -319,6 +338,10 @@ async function api(path, extra) {
   return j;
 }
 function statusText(r) {
+  const base = statusTextBase(r);
+  return r.strategy && r.strategy !== "control" ? `${base} · strategy: ${r.strategy}` : base;
+}
+function statusTextBase(r) {
   const fmt = x => Math.round(x).toLocaleString();
   if (r.method === "exact")
     return `Exact: all ${fmt(r.samples)} consistent layouts enumerated in ${r.seconds}s`;
@@ -546,7 +569,7 @@ document.addEventListener("keydown", e => {
   const k = {m:1, h:2, s:3, c:0}[e.key.toLowerCase()];
   if (k !== undefined) selectTool(k);
 });
-["samples", "parity", "notouch"].forEach(id => $(id).onchange = analyze);
+["samples", "parity", "notouch", "strategy"].forEach(id => $(id).onchange = analyze);
 $("showpct").onchange = renderBoard;
 $("rerun").onclick = analyze;
 $("newgame").onclick = () => {

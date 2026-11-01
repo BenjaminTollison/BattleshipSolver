@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import engine
+import strategies
 
 HERE = Path(__file__).resolve().parent
 
@@ -52,14 +53,26 @@ def board_from(payload) -> engine.Board:
                         no_touch=bool(payload.get("no_touch", False)))
 
 
+MAX_SAMPLES = 500_000          # matches the dashboard's largest option
+
+
 def analyze(payload):
     board = board_from(payload)
-    samples = max(200, min(int(payload.get("samples", 20000)), 200000))
+    samples = max(200, min(int(payload.get("samples", 20000)), MAX_SAMPLES))
     method = payload.get("method", "auto")
     if method not in engine.SAMPLING_METHODS:
         raise ValueError(f"method must be one of {list(engine.SAMPLING_METHODS)}")
-    sim = engine.simulate(board, samples, method=method)
-    rec = engine.recommend(board, sim, use_parity=bool(payload.get("parity", True)))
+    use_parity = bool(payload.get("parity", True))
+    spec = payload.get("strategy", "control")
+    if not isinstance(spec, str):
+        raise ValueError("strategy must be a string")
+    strat = strategies.make(spec)            # raises ValueError for unknown specs
+    if strat.name == "control":
+        # Baseline: unchanged recommendation path.
+        sim = engine.simulate(board, samples, method=method)
+        rec = engine.recommend(board, sim, use_parity=use_parity)
+    else:
+        sim, rec = _strategy_recommendation(board, strat, samples, method, use_parity)
     warnings = board.warnings()
     if not sim.consistent and board.remaining_ships():
         if sim.proven:
@@ -82,9 +95,34 @@ def analyze(payload):
         "proven": sim.proven,
         "total_layouts": sim.total_layouts,
         "rec": rec,
+        "strategy": strat.label(),
         "remaining": board.remaining_ships(),
         "warnings": warnings,
     }
+
+
+def _strategy_recommendation(board, strat, samples, method, use_parity):
+    """Heat map + recommendation for an experimental strategy.  The strategies
+    are defined on top of the checkerboard rule, so `parity` only affects the
+    ranking shown, not their own choice."""
+    sim = engine.simulate(board, strat.base_samples(samples), method=method,
+                          keep_layouts=strat.needs_layouts, keep_ships=strat.needs_ships)
+    if not sim.consistent or not board.remaining_ships():
+        return sim, engine.recommend(board, sim, use_parity=use_parity)
+    ctx = strategies.Context(method=method)
+    best = strat.choose(board, sim, ctx)
+    sim = ctx.decision_sim or sim
+    rec = engine.recommend(board, sim, use_parity=use_parity)
+    if best is not None and best != rec["best"]:
+        rec["ranked"] = ([{"idx": best, "name": engine.coord_name(*divmod(best, board.size)),
+                           "p": sim.probs[best], "fits": sim.fit_counts[best]}]
+                         + [r for r in rec["ranked"] if r["idx"] != best])[:len(rec["ranked"]) or 5]
+        rec["best"] = best
+        rec["best_name"] = engine.coord_name(*divmod(best, board.size))
+    rec["reason"] = f"{strat.label()} (experimental). " + rec["reason"]
+    # Sampled layouts are only needed for the decision; don't send them.
+    sim.layouts = sim.ship_layouts = sim.layout_weights = None
+    return sim, rec
 
 
 def sink(payload):

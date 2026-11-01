@@ -30,7 +30,9 @@ python server.py --port 9000 --no-browser
 3. When your opponent says "you sank my Cruiser", press **Sunk** next to the Cruiser.
    If the hits form one clear straight line, they turn into *sunk* squares on their
    own. If not, use the ■ Sunk tool on that ship's squares.
-4. The heat map and recommendation update after every change. Hover a square to see
+4. The heat map and recommendation update after every change. *Settings →
+   Experimental strategies* lets you try the research strategies; the baseline is the
+   default and none has beaten it so far (`STRATEGIES.md`). Hover a square to see
    its probability and how many ways a remaining ship fits through it.
    `Ctrl+Z` undoes a move. Your game is saved in the browser if you refresh.
 
@@ -99,4 +101,5 @@ with and without the checkerboard rule. See `BENCHMARKS.md` for a recorded run.
 * `BENCHMARKS.md`: results of a recorded benchmark run
 * `strategies.py`: control strategy + experimental shot-selection strategies and the
   paired self-play harness (see `STRATEGIES.md`)
-* `benchmarks/benchmark_strategies.py`: paired strategy benchmark with acceptance criteria
+* `benchmarks/benchmark_strategies.py`: paired strategy benchmark with provenance
+  checks, a progress bar, parameter-sweep presets and acceptance criteria
