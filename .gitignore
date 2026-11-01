@@ -8,3 +8,4 @@ venv/
 runs/*.md
 runs/*.csv
 runs/*.csv.meta.json
+runs/*.json

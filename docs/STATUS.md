@@ -16,6 +16,11 @@ not a claim that the experiments will outperform a human opponent.
 - **Alternatives:** adaptive checkerboard, expected-hits lookahead,
   outcome-aware rollout targeting, and adaptive Monte Carlo sampling are
   available as experiments, not unconditional upgrades.
+- **Adversarial placement (research):** `adversary.py` defines placement
+  rulesets (distributions over fleets weighted by edge, contact, stacking,
+  alignment, spread and obscurity features), samples them by MCMC under the
+  same house rules, and searches for the rulesets that cost the solver the most
+  shots. See [ADVERSARY.md](ADVERSARY.md).
 - **Validation:** tests compare model output with exhaustive small-board
   enumeration. The strategy runner compares paired games, tracks configurations,
   supports resuming, and shows a progress bar.
@@ -49,13 +54,18 @@ Do not compare their raw means as if they were the same software configuration.
 4. **Add browser automation.** Existing dashboard checks are primarily static
    or API-level; test clicks, undo, persistence, and pending-analysis updates in
    a browser environment.
-5. **Reduce experiment confusion.** Keep new CSV/metadata files in `runs/` and
+5. **Run the adversarial search** under standard and no-touch rules. If some
+   rulesets reliably cost several shots (an early check suggests rim/corner
+   placements do), evaluate a solver that hedges between uniform and adversarial
+   priors, and judge it on both kinds of fleets.
+6. **Reduce experiment confusion.** Keep new CSV/metadata files in `runs/` and
    new narrative reports there too; the material in `docs/reports/` is the frozen
    historical record.
 
 ## Where to look
 
 - [Strategy designs and benchmark workflow](STRATEGIES.md)
+- [Adversarial placement](ADVERSARY.md)
 - [Test coverage and limits](TESTING.md)
 - [Published report index](reports/README.md)
 - [README and quick start](../README.md)

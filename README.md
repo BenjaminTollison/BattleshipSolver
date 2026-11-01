@@ -70,6 +70,10 @@ python benchmarks/benchmark_sampling.py accuracy speed
 # Paired strategy comparison with live progress bar and resume support
 python benchmarks/benchmark_strategies.py --games 100 --jobs 8 \
   --csv runs/local_100.csv --out runs/local_100.md
+
+# Adversarial placement: which placement rulesets cost the solver the most shots?
+python benchmarks/adversary_search.py --jobs 8 --out runs/adversary_standard.md
+python benchmarks/adversary_search.py --no-touch --jobs 8 --out runs/adversary_no_touch.md
 ```
 
 For larger experiments, use separate result files and held-out fleet seeds.
@@ -85,7 +89,8 @@ changing the sampler or interpreting statistical differences.
 | `strategies.py` | Baseline and experimental shot-selection policies |
 | `server.py`, `dashboard.html` | Local API and interactive dashboard |
 | `tests/`, `test_engine.py` | Regression and statistical tests |
-| `benchmarks/` | Sampling and paired self-play runners |
+| `benchmarks/` | Sampling and paired self-play runners; adversarial placement search |
+| `adversary.py` | Adversarial placement rulesets (see [docs/ADVERSARY.md](docs/ADVERSARY.md)) |
 | [`docs/`](docs/STATUS.md) | Status, methodology, and historical research reports |
 | `runs/` | Benchmark CSVs and provenance metadata; new local runs go here |
 | `archive/` | Obsolete installation notes, previous patches, and legacy data |

@@ -589,11 +589,29 @@ def make(spec) -> Strategy:
 # --------------------------------------------------------------------------- #
 # Self-play
 # --------------------------------------------------------------------------- #
+def _check_layout(layout, size, fleet, no_touch):
+    """Reject fleets that break the rules the solver is told about."""
+    if sorted(n for n, _ in layout) != sorted(n for n, _ in fleet):
+        raise ValueError("layout does not match the fleet")
+    lengths = dict(fleet)
+    forbid = 0
+    for name, p in layout:
+        if len(p.cells) != lengths[name] or max(p.cells) >= size * size:
+            raise ValueError(f"bad placement for {name}")
+        if p.mask & forbid:
+            raise ValueError("ships overlap" + (" or touch" if no_touch else ""))
+        forbid |= p.halo if no_touch else p.mask
+
+
 def play(spec, layout_seed, samples=1500, method="auto", fleet=e.DEFAULT_FLEET,
-         size=10, no_touch=False, shooter_seed=None):
+         size=10, no_touch=False, shooter_seed=None, layout=None):
     """
     Play one game against the uniformly random fleet
-    random_layout(Random(layout_seed)).  Returns shots, the hunt/target split,
+    random_layout(Random(layout_seed)), or against `layout` (a list of
+    (name, Placement) as returned by engine.random_layout) if given - e.g. a
+    fleet chosen by an adversarial placement policy (adversary.py).  The
+    shooter's random stream still comes from `layout_seed` unless
+    `shooter_seed` is given.  Returns shots, the hunt/target split,
     Monte Carlo layouts drawn and their effective sample size (summed over
     sampled shots), shots decided by exact enumeration, and wall time.
     """
@@ -603,7 +621,10 @@ def play(spec, layout_seed, samples=1500, method="auto", fleet=e.DEFAULT_FLEET,
         shooter_seed = layout_seed * 7919 + 1          # as benchmark_sampling.py
     rng = random.Random(shooter_seed)
     ctx = Context(method=method, extra_rng=random.Random(shooter_seed ^ 0x5EED))
-    layout = e.random_layout(size, fleet, random.Random(layout_seed), no_touch)
+    if layout is None:
+        layout = e.random_layout(size, fleet, random.Random(layout_seed), no_touch)
+    else:
+        _check_layout(layout, size, fleet, no_touch)
     board = e.Board(size=size, fleet=list(fleet), no_touch=no_touch)
     alive = {k: set(p.cells) for k, (_, p) in enumerate(layout)}
     names = {k: n for k, (n, _) in enumerate(layout)}

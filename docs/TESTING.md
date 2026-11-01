@@ -108,3 +108,17 @@ scattered hits, no-touch, duplicate ship lengths, and a late-game position.
   option.
 * Dashboard: the strategy selector defaults to Baseline, and every option is a valid
   strategy spec.
+
+## Adversarial placement (`tests/test_adversary.py`)
+
+* Features of hand-built fleets (edge, contact, parallel stacking, alignment, spread,
+  obscurity). Contact and parallel stacking can't vary under no-touch, so they are
+  ignored there.
+* Every preset samples legal, deterministic fleets with and without the no-touch rule.
+  An all-zero policy is exactly `engine.random_layout`.
+* The MCMC sampler's feature means match the exact tilted distribution, by brute force
+  on a 5×5 board, under both rule sets. The presets shift their features.
+* `strategies.play(layout=...)` reproduces the default game for the same fleet and
+  rejects overlapping fleets, and touching ones under no-touch.
+* The cross-entropy search finds the maximum of a known objective. The runner works
+  end to end on a small board with house rules.
