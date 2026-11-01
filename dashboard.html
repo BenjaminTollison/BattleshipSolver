@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Battleship Assistant</title>
+<style>
+  :root {
+    --surface-0: #f4f3f0;
+    --surface-1: #fcfcfb;
+    --border: #dcdad4;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #7a7974;
+    --accent: #eb6834;            /* recommended-move ring */
+    --hit: #c8352e;
+    --sunk: #3a3936;
+    --miss: #e4e2dc;
+    --miss-dot: #8f8d86;
+    --btn: #ecebe7;
+    --btn-active: #0d366b;
+    --warn-bg: #fff4e0;
+    --warn-ink: #7a4a00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-0: #121211;
+      --surface-1: #1a1a19;
+      --border: #34332f;
+      --text-primary: #f0efec;
+      --text-secondary: #c3c2b7;
+      --text-muted: #8f8e86;
+      --accent: #f07a45;
+      --hit: #e0483f;
+      --sunk: #5b5a55;
+      --miss: #2a2a28;
+      --miss-dot: #8f8e86;
+      --btn: #2a2a28;
+      --btn-active: #3987e5;
+      --warn-bg: #3a2c12;
+      --warn-ink: #f3c87a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--surface-0); color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 16px 24px 4px;
+  }
+  header h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  header .sub { color: var(--text-secondary); }
+  main {
+    display: grid; grid-template-columns: minmax(420px, 620px) minmax(320px, 1fr);
+    gap: 20px; padding: 12px 24px 32px; align-items: start;
+  }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px;
+  }
+  .card + .card { margin-top: 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+             color: var(--text-secondary); margin: 0 0 10px; font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button, select, input[type=text], input[type=number] {
+    font: inherit; color: var(--text-primary); background: var(--btn);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px;
+  }
+  button { cursor: pointer; }
+  button:hover { filter: brightness(0.96); }
+  button.primary { background: var(--btn-active); color: #fff; border-color: transparent; }
+  button.tool.active { background: var(--btn-active); color: #fff; border-color: transparent; }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=text] { flex: 1; min-width: 140px; }
+  kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--border);
+        border-radius: 3px; padding: 0 4px; color: var(--text-muted); }
+
+  /* ---------- board ---------- */
+  .board-wrap { position: relative; }
+  .board {
+    display: grid; gap: 2px; user-select: none;
+    grid-template-columns: 26px repeat(var(--n), 1fr);
+  }
+  .lbl { display: flex; align-items: center; justify-content: center;
+         color: var(--text-muted); font-size: 12px; font-weight: 600; }
+  .cell {
+    position: relative; aspect-ratio: 1 / 1; border-radius: 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-variant-numeric: tabular-nums; cursor: pointer;
+    background: var(--surface-1); outline: 1px solid var(--border); outline-offset: -1px;
+    transition: transform .05s;
+  }
+  .cell:hover { transform: scale(1.06); z-index: 2; }
+  .cell.miss { background: var(--miss); outline: none; }
+  .cell.miss::after { content: ""; width: 22%; height: 22%; border-radius: 50%; background: var(--miss-dot); }
+  .cell.hit { background: var(--hit); outline: none; color: #fff; font-size: 18px; font-weight: 700; }
+  .cell.sunk { background: var(--sunk); outline: none; color: #d8d6cf; font-size: 16px; }
+  .cell.best { outline: 3px solid var(--accent); outline-offset: -1px; z-index: 1; }
+  .cell.best::before {
+    content: "★"; position: absolute; top: -2px; right: 2px; font-size: 12px; color: var(--accent);
+  }
+  .cell.parity .pdot {
+    position: absolute; left: 3px; top: 3px; width: 4px; height: 4px; border-radius: 50%;
+    background: currentColor; opacity: .75; width: 5px; height: 5px;
+  }
+  .tooltip {
+    position: fixed; pointer-events: none; z-index: 10; display: none;
+    background: var(--surface-1); color: var(--text-primary); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.15);
+  }
+  .tooltip b { font-size: 13px; }
+  .legend { display: flex; align-items: center; gap: 10px; margin-top: 12px; flex-wrap: wrap;
+            color: var(--text-secondary); font-size: 12px; }
+  @media (prefers-color-scheme: dark) { .ramp { transform: scaleX(-1); } }
+  .ramp { width: 160px; height: 10px; border-radius: 3px;
+    background: linear-gradient(90deg,#cde2fb,#9ec5f4,#6da7ec,#3987e5,#256abf,#184f95,#0d366b); }
+  .sw { display: inline-block; width: 14px; height: 14px; border-radius: 3px; vertical-align: -3px; margin-right: 4px; }
+  .status { color: var(--text-muted); font-size: 12px; min-height: 18px; margin-top: 6px; }
+
+  /* ---------- recommendation ---------- */
+  .rec-head { display: flex; align-items: center; gap: 14px; }
+  .rec-cell { font-size: 40px; font-weight: 700; letter-spacing: -0.02em; line-height: 1; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px;
+           border-radius: 99px; letter-spacing: .05em; }
+  .badge.hunt { background: #cde2fb; color: #0d366b; }
+  .badge.target { background: #fbd9cb; color: #7d2a0c; }
+  .badge.done { background: #d4eed9; color: #1b5e2a; }
+  .reason { color: var(--text-secondary); margin: 8px 0 12px; }
+  .toplist { list-style: none; padding: 0; margin: 0; }
+  .toplist li { display: grid; grid-template-columns: 22px 40px 1fr 54px; gap: 8px;
+                align-items: center; padding: 3px 0; font-variant-numeric: tabular-nums; }
+  .toplist .bar { height: 8px; border-radius: 0 4px 4px 0; background: #2a78d6; }
+  .toplist .muted { color: var(--text-muted); font-size: 12px; }
+  .toplist li:hover { background: color-mix(in srgb, var(--btn) 60%, transparent); cursor: pointer; }
+
+  /* ---------- fleet ---------- */
+  .ship { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center;
+          padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .ship:last-child { border-bottom: none; }
+  .pips { display: flex; gap: 2px; }
+  .pip { width: 12px; height: 12px; border-radius: 2px; background: #2a78d6; }
+  .ship.sunk .pip { background: var(--sunk); }
+  .ship.sunk .name { text-decoration: line-through; color: var(--text-muted); }
+  .ship button { min-width: 78px; }
+  .edit-row { display: grid; grid-template-columns: 1fr 70px 32px; gap: 6px; margin-bottom: 6px; }
+  .warn { background: var(--warn-bg); color: var(--warn-ink); border-radius: 6px;
+          padding: 8px 10px; margin-top: 10px; font-size: 13px; }
+  .warn::before { content: "⚠ "; }
+  .note { color: var(--text-secondary); font-size: 13px; margin-top: 8px; }
+  .history { max-height: 160px; overflow: auto; font: 12px ui-monospace, monospace;
+             color: var(--text-secondary); margin-top: 8px; }
+  label.chk { display: flex; gap: 6px; align-items: center; }
+  details summary { cursor: pointer; color: var(--text-secondary); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Battleship Assistant</h1>
+  <span class="sub">Monte-Carlo heat map · checkerboard hunt · best next shot</span>
+</header>
+
+<main>
+  <!-- ======================= LEFT: BOARD ======================= -->
+  <section>
+    <div class="card">
+      <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+        <div class="row" id="tools">
+          <span style="color:var(--text-secondary)">Click squares to mark:</span>
+          <button class="tool active" data-tool="1">○ Miss <kbd>M</kbd></button>
+          <button class="tool" data-tool="2">✕ Hit <kbd>H</kbd></button>
+          <button class="tool" data-tool="3">■ Sunk <kbd>S</kbd></button>
+          <button class="tool" data-tool="0">Clear <kbd>C</kbd></button>
+        </div>
+        <button id="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
+      </div>
+
+      <div class="board-wrap"><div class="board" id="board"></div></div>
+
+      <div class="legend">
+        <span>Chance a ship is there:</span>
+        <span>0%</span><span class="ramp"></span><span id="legend-max">–</span>
+        <span><span class="sw" style="background:var(--miss)"></span>Miss</span>
+        <span><span class="sw" style="background:var(--hit)"></span>Hit</span>
+        <span><span class="sw" style="background:var(--sunk)"></span>Sunk</span>
+        <span><span class="sw" style="outline:3px solid var(--accent);outline-offset:-3px"></span>Best shot</span>
+        <span id="parity-legend">• = checkerboard search square</span>
+      </div>
+      <div class="status" id="status"></div>
+    </div>
+
+    <div class="card">
+      <h2>Quick entry</h2>
+      <div class="row">
+        <button class="primary" id="rec-miss">Best shot was a MISS</button>
+        <button class="primary" id="rec-hit" style="background:var(--hit)">Best shot was a HIT</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <input type="text" id="cmd" placeholder="Type shots, e.g.  B5 hit, C7 miss, D2 sunk, E4 clear">
+        <button id="cmd-go">Apply</button>
+      </div>
+      <div class="note" id="cmd-msg"></div>
+      <details style="margin-top:10px"><summary>Move history</summary>
+        <div class="history" id="history"></div>
+      </details>
+    </div>
+  </section>
+
+  <!-- ======================= RIGHT: PANELS ======================= -->
+  <section>
+    <div class="card" id="rec-card">
+      <h2>Recommended next shot</h2>
+      <div class="rec-head">
+        <div class="rec-cell" id="rec-name">–</div>
+        <div>
+          <span class="badge" id="rec-mode">…</span>
+          <div style="color:var(--text-secondary); margin-top:4px" id="rec-prob"></div>
+        </div>
+      </div>
+      <div class="reason" id="rec-reason"></div>
+      <ul class="toplist" id="toplist"></ul>
+      <div id="warnings"></div>
+    </div>
+
+    <div class="card">
+      <h2>Fleet (enemy ships)</h2>
+      <div id="fleet"></div>
+      <div class="note">When you sink a ship, press its <b>Sunk</b> button right after marking the final hit.
+        If the hits form a clear straight line, those squares are switched to <b>Sunk</b> automatically;
+        if not, use the ■ Sunk tool to mark that ship's squares.</div>
+      <details style="margin-top:10px"><summary>Edit fleet (house rules / custom ships)</summary>
+        <div id="fleet-edit" style="margin-top:8px"></div>
+        <div class="row">
+          <button id="fleet-add">+ Add ship</button>
+          <button id="fleet-apply" class="primary">Apply fleet</button>
+          <button id="fleet-std">Standard fleet</button>
+        </div>
+      </details>
+    </div>
+
+    <div class="card">
+      <h2>Settings</h2>
+      <div class="row" style="gap:16px">
+        <label>Simulations
+          <select id="samples">
+            <option value="5000">5,000 (fast)</option>
+            <option value="20000" selected>20,000</option>
+            <option value="50000">50,000</option>
+            <option value="100000">100,000 (slow)</option>
+          </select>
+        </label>
+        <label>Board
+          <select id="size">
+            <option>8</option><option>9</option><option selected>10</option><option>11</option><option>12</option>
+          </select>
+        </label>
+      </div>
+      <div style="margin-top:10px; display:grid; gap:6px">
+        <label class="chk"><input type="checkbox" id="parity" checked> Checkerboard (parity) search while hunting</label>
+        <label class="chk"><input type="checkbox" id="notouch"> House rule: ships may not touch (not even diagonally)</label>
+        <label class="chk"><input type="checkbox" id="showpct" checked> Show % on squares</label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button id="rerun">Re-run simulation</button>
+        <button id="newgame">New game</button>
+      </div>
+    </div>
+  </section>
+</main>
+<div class="tooltip" id="tip"></div>
+
+<script>
+const STD_FLEET = [["Carrier",5],["Battleship",4],["Cruiser",3],["Submarine",3],["Destroyer",2]];
+const RAMP = ["#cde2fb","#b7d3f6","#9ec5f4","#86b6ef","#6da7ec","#5598e7","#3987e5",
+              "#2a78d6","#256abf","#1c5cab","#184f95","#104281","#0d366b"];
+const ROWS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const SYMBOL = {0:"", 1:"", 2:"✕", 3:"✕"};
+const CLS = {0:"", 1:"miss", 2:"hit", 3:"sunk"};
+
+let S = freshState(10);
+let tool = 1, result = null, busy = false, pending = false, history = [];
+
+function freshState(size) {
+  return { size, grid: Array(size*size).fill(0), fleet: STD_FLEET.map(x => [...x]),
+           sunk: [], lastHit: null, log: [] };
+}
+const name = i => ROWS[Math.floor(i / S.size)] + (i % S.size + 1);
+
+// -------- persistence (best effort) --------
+function save() { try { localStorage.setItem("bs-assist", JSON.stringify(S)); } catch (e) {} }
+function load() {
+  try { const t = JSON.parse(localStorage.getItem("bs-assist")); if (t && t.grid) S = t; } catch (e) {}
+}
+
+// -------- state changes --------
+function snapshot() { history.push(JSON.stringify(S)); if (history.length > 300) history.shift(); }
+function setCell(i, st, source) {
+  if (S.grid[i] === st) return false;
+  snapshot();
+  S.grid[i] = st;
+  if (st === 2) S.lastHit = i;
+  S.log.push(`${name(i)} → ${["clear","miss","hit","sunk"][st]}${source ? " ("+source+")" : ""}`);
+  return true;
+}
+function changed() { save(); renderBoard(); renderFleet(); renderHistory(); analyze(); }
+
+// -------- API --------
+async function api(path, extra) {
+  const body = { size: S.size, grid: S.grid, fleet: S.fleet, sunk: S.sunk,
+                 no_touch: $("notouch").checked, parity: $("parity").checked,
+                 samples: +$("samples").value, ...extra };
+  const r = await fetch(path, { method: "POST", headers: {"Content-Type":"application/json"},
+                                body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+async function analyze() {
+  if (busy) { pending = true; return; }
+  busy = true; $("status").textContent = "Simulating…";
+  try {
+    result = await api("/api/analyze");
+    $("status").textContent =
+      `${result.samples.toLocaleString()} random layouts consistent with the board ` +
+      `(${result.attempts.toLocaleString()} tried) in ${result.seconds}s`;
+  } catch (e) { $("status").textContent = "Error: " + e.message; result = null; }
+  busy = false;
+  renderBoard(); renderRec();
+  if (pending) { pending = false; analyze(); }
+}
+
+// -------- rendering --------
+const $ = id => document.getElementById(id);
+const DARK = window.matchMedia && matchMedia("(prefers-color-scheme: dark)");
+const isDark = () => !!(DARK && DARK.matches);
+// Light theme: near-zero recedes to pale, high = deep blue.
+// Dark theme: its own direction - near-zero recedes to deep navy, high = bright.
+function rampIndex(t) { return Math.min(RAMP.length - 1, Math.max(0, Math.round(t * (RAMP.length - 1)))); }
+function rampColor(t) { const k = rampIndex(t); return isDark() ? RAMP[RAMP.length - 1 - k] : RAMP[k]; }
+function inkOn(t) { const strong = t > 0.5; return (isDark() ? !strong : strong) ? "#fff" : "#0b0b0b"; }
+if (DARK && DARK.addEventListener) DARK.addEventListener("change", () => renderBoard());
+
+function renderBoard() {
+  const b = $("board"), n = S.size;
+  b.style.setProperty("--n", n);
+  b.innerHTML = "";
+  b.appendChild(div("lbl", ""));
+  for (let c = 0; c < n; c++) b.appendChild(div("lbl", c + 1));
+  const probs = result && result.probs.length === n*n ? result.probs : null;
+  const maxp = probs ? Math.max(1e-9, ...probs) : 1;
+  const best = result && result.rec ? result.rec.best : null;
+  const par = result && result.rec ? result.rec.parity : null;
+  const showPct = $("showpct").checked;
+  $("legend-max").textContent = probs ? (maxp * 100).toFixed(0) + "%" : "–";
+  $("parity-legend").style.display = par ? "" : "none";
+
+  for (let r = 0; r < n; r++) {
+    b.appendChild(div("lbl", ROWS[r]));
+    for (let c = 0; c < n; c++) {
+      const i = r*n + c, st = S.grid[i];
+      const el = div("cell " + CLS[st], SYMBOL[st]);
+      if (st === 0 && probs) {
+        const t = probs[i] / maxp;
+        el.style.background = probs[i] > 0 ? rampColor(t) : "var(--surface-1)";
+        el.style.color = inkOn(t);
+        if (probs[i] === 0) el.style.color = "var(--text-muted)";
+        if (showPct) el.textContent = probs[i] > 0 ? Math.round(probs[i]*100) : "0";
+        if (par && (r + c) % par.modulus === par.cls) {
+          el.classList.add("parity");
+          const d = document.createElement("span"); d.className = "pdot"; el.appendChild(d);
+        }
+      }
+      if (i === best) el.classList.add("best");
+      el.onclick = () => { if (setCell(i, S.grid[i] === tool ? 0 : tool)) changed(); };
+      el.onmousemove = ev => showTip(ev, i);
+      el.onmouseleave = () => $("tip").style.display = "none";
+      b.appendChild(el);
+    }
+  }
+}
+function div(cls, txt) { const d = document.createElement("div"); d.className = cls; d.textContent = txt; return d; }
+
+function showTip(ev, i) {
+  const t = $("tip"), st = S.grid[i];
+  let html = `<b>${name(i)}</b><br>`;
+  if (st) html += ["", "Miss", "Hit (ship not yet sunk)", "Part of a sunk ship"][st];
+  else if (result) html += `${(result.probs[i]*100).toFixed(1)}% chance of a ship<br>` +
+                           `${result.fits[i]} ways a remaining ship fits here`;
+  html += `<br><span style="color:var(--text-muted)">click: ${["clear","mark miss","mark hit","mark sunk"][tool]}</span>`;
+  t.innerHTML = html; t.style.display = "block";
+  t.style.left = (ev.clientX + 14) + "px"; t.style.top = (ev.clientY + 14) + "px";
+}
+
+function renderRec() {
+  const w = $("warnings"); w.innerHTML = "";
+  if (!result) return;
+  const rec = result.rec;
+  $("rec-name").textContent = rec.best_name || "—";
+  const m = $("rec-mode"); m.className = "badge " + rec.mode;
+  m.textContent = {hunt:"HUNT", target:"TARGET", done:"ALL SUNK"}[rec.mode];
+  $("rec-prob").textContent = rec.best != null
+      ? `${(result.probs[rec.best]*100).toFixed(1)}% chance of a hit` : "";
+  $("rec-reason").textContent = rec.reason;
+  const ul = $("toplist"); ul.innerHTML = "";
+  const top = rec.ranked.length ? rec.ranked[0].p : 1;
+  rec.ranked.forEach((x, k) => {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="muted">${k+1}.</span><b>${x.name}</b>
+      <div class="bar" style="width:${Math.max(4, 100 * x.p / (top || 1))}%"></div>
+      <span>${(x.p*100).toFixed(1)}%</span>`;
+    li.title = `${x.fits} ways a remaining ship fits through ${x.name}`;
+    ul.appendChild(li);
+  });
+  result.warnings.forEach(t => { const d = div("warn", t); w.appendChild(d); });
+  $("rec-miss").disabled = $("rec-hit").disabled = rec.best == null;
+}
+
+function remainingCount(nm) { // how many ships with this name are still afloat
+  const total = S.fleet.filter(f => f[0] === nm).length;
+  return total - S.sunk.filter(s => s === nm).length;
+}
+function renderFleet() {
+  const f = $("fleet"); f.innerHTML = "";
+  const seen = {};
+  S.fleet.forEach(([nm, L]) => {
+    seen[nm] = (seen[nm] || 0) + 1;
+    const isSunk = S.sunk.filter(s => s === nm).length >= seen[nm];
+    const row = div("ship" + (isSunk ? " sunk" : ""), "");
+    const n = div("name", `${nm} (${L})`);
+    const pips = div("pips", ""); for (let k = 0; k < L; k++) pips.appendChild(div("pip", ""));
+    const btn = document.createElement("button");
+    btn.textContent = isSunk ? "Undo sunk" : "Sunk";
+    btn.onclick = () => isSunk ? unsink(nm) : sinkShip(nm);
+    row.append(n, pips, btn); f.appendChild(row);
+  });
+  renderFleetEditor();
+}
+async function sinkShip(nm) {
+  snapshot();
+  try {
+    const r = await api("/api/sink", { ship: nm, last: S.lastHit });
+    S.grid = r.grid; S.sunk = r.sunk;
+    S.log.push(`${nm} sunk` + (r.converted.length ? ` (${r.converted.map(name).join(" ")})` : ""));
+    $("cmd-msg").textContent = r.converted.length
+      ? `${nm} sunk - marked ${r.converted.map(name).join(", ")} as sunk.`
+      : `${nm} sunk. Couldn't tell which hits were the ${nm}; use the ■ Sunk tool on its squares.`;
+    if (!r.converted.length && S.grid.includes(2)) selectTool(3);
+  } catch (e) { $("cmd-msg").textContent = "Error: " + e.message; history.pop(); }
+  changed();
+}
+function unsink(nm) {
+  snapshot();
+  const k = S.sunk.lastIndexOf(nm); if (k >= 0) S.sunk.splice(k, 1);
+  S.log.push(`${nm} un-sunk`);
+  $("cmd-msg").textContent = `${nm} back afloat - switch its squares from Sunk back to Hit if needed.`;
+  changed();
+}
+
+// -------- fleet editor --------
+let editFleet = null;
+function renderFleetEditor() {
+  if (!editFleet) editFleet = S.fleet.map(x => [...x]);
+  const box = $("fleet-edit"); box.innerHTML = "";
+  editFleet.forEach((s, k) => {
+    const row = div("edit-row", "");
+    const a = document.createElement("input"); a.type = "text"; a.value = s[0];
+    a.oninput = () => s[0] = a.value;
+    const b = document.createElement("input"); b.type = "number"; b.min = 1; b.max = 12; b.value = s[1];
+    b.oninput = () => s[1] = +b.value;
+    const x = document.createElement("button"); x.textContent = "×";
+    x.onclick = () => { editFleet.splice(k, 1); renderFleetEditor(); };
+    row.append(a, b, x); box.appendChild(row);
+  });
+}
+$("fleet-add").onclick = () => { editFleet.push([`Ship ${editFleet.length+1}`, 3]); renderFleetEditor(); };
+$("fleet-std").onclick = () => { editFleet = STD_FLEET.map(x => [...x]); renderFleetEditor(); };
+$("fleet-apply").onclick = () => {
+  const clean = editFleet.filter(s => s[0].trim() && s[1] >= 1 && s[1] <= S.size)
+                         .map(s => [s[0].trim(), Math.round(s[1])]);
+  if (!clean.length) return;
+  snapshot();
+  S.fleet = clean; editFleet = null;
+  S.sunk = S.sunk.filter(nm => clean.some(f => f[0] === nm));
+  S.log.push("fleet changed: " + clean.map(f => `${f[0]}(${f[1]})`).join(", "));
+  changed();
+};
+
+// -------- quick entry --------
+function applyToBest(st) {
+  if (!result || result.rec.best == null) return;
+  if (setCell(result.rec.best, st, "recommended")) changed();
+}
+$("rec-miss").onclick = () => applyToBest(1);
+$("rec-hit").onclick = () => applyToBest(2);
+
+function runCommands() {
+  const words = {m:1, miss:1, o:1, h:2, hit:2, x:2, s:3, sunk:3, c:0, clear:0, u:0};
+  const parts = $("cmd").value.split(/[,;\n]+/).map(s => s.trim()).filter(Boolean);
+  const done = [], bad = [];
+  let any = false;
+  for (const p of parts) {
+    const m = p.match(/^([A-Za-z])\s*(\d{1,2})\s*[:=]?\s*([A-Za-z]+)$/);
+    if (!m) { bad.push(p); continue; }
+    const r = ROWS.indexOf(m[1].toUpperCase()), c = +m[2] - 1, st = words[m[3].toLowerCase()];
+    if (r < 0 || r >= S.size || c < 0 || c >= S.size || st === undefined) { bad.push(p); continue; }
+    if (setCell(r*S.size + c, st, "typed")) any = true;
+    done.push(p);
+  }
+  $("cmd-msg").textContent = (done.length ? `Applied: ${done.join(", ")}. ` : "") +
+                             (bad.length ? `Couldn't read: ${bad.join(", ")} (use e.g. "B5 hit").` : "");
+  if (!bad.length) $("cmd").value = "";
+  if (any) changed();
+}
+$("cmd-go").onclick = runCommands;
+$("cmd").addEventListener("keydown", e => { if (e.key === "Enter") runCommands(); });
+
+function renderHistory() {
+  $("history").innerHTML = S.log.slice().reverse().map((l, k) => `${S.log.length - k}. ${l}`).join("<br>") || "No moves yet.";
+}
+
+// -------- tools, undo, settings --------
+function selectTool(t) {
+  tool = t;
+  document.querySelectorAll(".tool").forEach(b => b.classList.toggle("active", +b.dataset.tool === t));
+}
+document.querySelectorAll(".tool").forEach(b => b.onclick = () => selectTool(+b.dataset.tool));
+function undo() {
+  if (!history.length) return;
+  S = JSON.parse(history.pop()); editFleet = null; changed();
+}
+$("undo").onclick = undo;
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); undo(); return; }
+  const k = {m:1, h:2, s:3, c:0}[e.key.toLowerCase()];
+  if (k !== undefined) selectTool(k);
+});
+["samples", "parity", "notouch"].forEach(id => $(id).onchange = analyze);
+$("showpct").onchange = renderBoard;
+$("rerun").onclick = analyze;
+$("newgame").onclick = () => {
+  snapshot(); const fleet = S.fleet; S = freshState(+$("size").value); S.fleet = fleet;
+  editFleet = null; $("cmd-msg").textContent = ""; changed();
+};
+$("size").onchange = $("newgame").onclick;
+
+load();
+$("size").value = S.size;
+changed();
+</script>
+</body>
+</html>
