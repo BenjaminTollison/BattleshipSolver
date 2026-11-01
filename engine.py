@@ -17,6 +17,9 @@ Core ideas
         - ships don't overlap (or touch, if that rule is on),
         - every un-sunk HIT square is covered by some ship.
     Counting how often each square is occupied gives a probability heat map.
+    Layouts are drawn *uniformly* over all consistent layouts (exact rejection
+    sampling, exact enumeration, or weighted importance sampling - see the
+    "Monte-Carlo simulation" section).
   * Recommendation:
         - TARGET mode (there are un-sunk hits): fire at the most probable square.
         - HUNT mode (no open hits): checkerboard / parity search. With smallest
@@ -210,15 +213,64 @@ class Board:
 # --------------------------------------------------------------------------- #
 # Monte-Carlo simulation
 # --------------------------------------------------------------------------- #
+#
+# Target distribution
+#   Every *complete* layout of the remaining (labelled) ships that satisfies
+#   the board is equally likely: ships avoid MISS/SUNK squares (and, under the
+#   no-touch rule, the halo of SUNK squares and of each other), never overlap,
+#   and jointly cover every open HIT.  A square's probability is the fraction
+#   of those layouts that occupy it.
+#
+# Samplers (choose with simulate(..., method=...))
+#   "rejection"  Exact.  Each ship's placement is drawn independently and
+#                uniformly from its statically legal placements; the whole
+#                fleet is kept only if it is legal.  Accepted layouts are
+#                i.i.d. uniform over the target set.  Slow when acceptance is
+#                low (several open hits).
+#   "exact"      Exact enumeration by depth-first search (with a node cap).
+#                Probabilities are exact, not estimates.
+#   "weighted"   Sequential importance sampling for constrained boards.  Ships
+#                are placed one at a time (first ships that cover the
+#                lowest-index uncovered hit, then the rest in a fixed order),
+#                choosing uniformly among the n_k legal options at each step.
+#                Every legal layout is reachable by exactly one such path, so
+#                weighting a layout by prod(n_k) makes the weighted counts
+#                unbiased for the true layout counts (Knuth's estimator).
+#                Probabilities are the self-normalised ratio - consistent,
+#                with O(1/N) bias.  `ess` reports the effective sample size.
+#   "sequential" The previous sampler (same construction, *no* weights).
+#                Biased - kept only for comparison / benchmarks.
+#   "auto"       Default.  Pilot rejection run; keep rejection if the
+#                projected number of proposals is acceptable, else exact enumeration if the
+#                layout count is small, else weighted sampling.
+
+SAMPLING_METHODS = ("auto", "rejection", "exact", "weighted", "sequential")
+
+# Tunables for method="auto".
+AUTO_PILOT_PROPOSALS = 4000          # rejection pilot size
+AUTO_REJECTION_PROPOSALS = 400_000   # use rejection if the projected number of
+                                     # proposals fits (~1.5 s in CPython).  A count,
+                                     # not a time, so a seed gives the same method
+                                     # and result on every machine.
+AUTO_EXACT_NODE_CAP = 150_000        # DFS nodes before falling back to weighting
+
+
 @dataclass
 class SimResult:
     probs: list            # flat list, probability each square holds a ship
-    counts: list
-    samples: int
-    attempts: int
+                           # (known squares are masked to 0)
+    counts: list           # occupancy counts scaled to `samples` layouts
+                           # (ints for rejection/exact/sequential, floats for weighted)
+    samples: int           # accepted layouts (exact: number of consistent layouts)
+    attempts: int          # proposals / particles / DFS nodes used
     seconds: float
     fit_counts: list       # number of legal single-ship placements through each square
-    consistent: bool
+    consistent: bool       # at least one consistent layout found
+    method: str = "rejection"
+    ess: float = 0.0       # effective sample size (== samples for i.i.d. methods)
+    exact: bool = False    # probabilities are exact (enumeration)
+    proven: bool = False   # `consistent` is a proof (exact enumeration completed)
+    total_layouts: float = 0.0   # exact count (exact) or unbiased estimate (weighted)
 
 
 def _random_bit(mask: int, rng: random.Random) -> int:
@@ -233,68 +285,234 @@ def _random_bit(mask: int, rng: random.Random) -> int:
     return rng.choice(bits)
 
 
-def simulate(board: Board, n_samples: int = 20000, seed=None,
-             time_limit: float = 8.0) -> SimResult:
-    rng = random.Random(seed)
+def _popcount(x: int) -> int:
+    return bin(x).count("1")           # int.bit_count() needs Python 3.10+
+
+
+def _bits(mask: int):
+    while mask:
+        low = mask & -mask
+        yield low.bit_length() - 1
+        mask ^= low
+
+
+@dataclass
+class _Prep:
+    size: int
+    ncell: int
+    ships: list            # remaining ship lengths, longest first
+    blocked: int
+    hit_m: int
+    no_touch: bool
+    valid: dict            # length -> [Placement] avoiding blocked squares
+    valid_by_cell: dict    # length -> cell -> [Placement]
+    fit_counts: list
+
+
+def _prepare(board: Board) -> _Prep:
     size = board.size
     ncell = size * size
-    ships = [L for _, L in board.remaining_ships()]
-    ships.sort(reverse=True)
-
-    miss_m = board.mask_of(MISS)
+    ships = sorted((L for _, L in board.remaining_ships()), reverse=True)
     sunk_m = board.mask_of(SUNK)
     hit_m = board.mask_of(HIT)
-    blocked = miss_m | sunk_m
+    blocked = board.mask_of(MISS) | sunk_m
     if board.no_touch:
-        # squares next to a sunk ship can't hold another ship
-        for i in range(ncell):
-            if sunk_m >> i & 1:
-                # A hit in this halo makes the state inconsistent; it must NOT
-                # be exempted, because ships cannot touch under this house rule.
-                blocked |= _neighbour_mask(i, size)
-
-    # legal placements for every remaining ship (static constraints only)
-    valid = {}
-    valid_by_cell = {}
+        for i in _bits(sunk_m):
+            # A hit in this halo makes the state inconsistent; it must NOT
+            # be exempted, because ships cannot touch under this house rule.
+            blocked |= _neighbour_mask(i, size)
+    valid, valid_by_cell = {}, {}
     for L in set(ships):
         allp, by_cell = placements_for(L, size)
         valid[L] = [p for p in allp if not p.mask & blocked]
         valid_by_cell[L] = [[p for p in lst if not p.mask & blocked] for lst in by_cell]
-
-    # deterministic "how many ways can a remaining ship fit through here" map
     fit_counts = [0] * ncell
     for L in ships:
         for p in valid[L]:
             for i in p.cells:
                 fit_counts[i] += 1
+    return _Prep(size, ncell, ships, blocked, hit_m, board.no_touch,
+                 valid, valid_by_cell, fit_counts)
 
-    counts = [0] * ncell
+
+def _finish(board, prep, counts, samples, attempts, t0, method, *, ess=None,
+            exact=False, proven=False, total=0.0, weight_sum=None):
+    """Turn raw occupancy tallies into a SimResult."""
+    if weight_sum is not None:                       # weighted tallies
+        probs = [c / weight_sum for c in counts] if weight_sum > 0 else [0.0] * prep.ncell
+        counts = [p * samples for p in probs]
+    else:
+        probs = [c / samples if samples else 0.0 for c in counts]
+    for i, s in enumerate(board.grid):
+        if s != UNKNOWN:
+            probs[i] = 0.0
+    return SimResult(probs, counts, samples, attempts, time.time() - t0,
+                     prep.fit_counts, samples > 0, method=method,
+                     ess=float(samples if ess is None else ess), exact=exact,
+                     proven=proven, total_layouts=float(total))
+
+
+# ---- exact i.i.d. rejection sampling -------------------------------------- #
+def _rejection(prep, n_samples, rng, deadline, max_proposals, counts=None,
+               accepted=0, proposals=0):
+    """Returns (counts, accepted, proposals).  Can resume a previous run."""
+    if counts is None:
+        counts = [0] * prep.ncell
+    pools = [([p.mask for p in prep.valid[L]], [p.halo for p in prep.valid[L]])
+             for L in prep.ships]
+    if any(not m for m, _ in pools):
+        return counts, accepted, proposals
+    pools = [(m, h, len(m)) for m, h in pools]
+    hit_m, no_touch, rr = prep.hit_m, prep.no_touch, rng.randrange
+    while accepted < n_samples and proposals < max_proposals:
+        proposals += 1
+        if proposals % 4096 == 0 and time.time() > deadline:
+            break
+        occupied = forbid = 0
+        for masks, halos, n in pools:
+            k = rr(n)
+            m = masks[k]
+            if m & forbid:
+                break
+            occupied |= m
+            forbid |= halos[k] if no_touch else m
+        else:
+            if hit_m & ~occupied:
+                continue
+            accepted += 1
+            for i in _bits(occupied):
+                counts[i] += 1
+    return counts, accepted, proposals
+
+
+# ---- shared step logic for the hit-first construction ---------------------- #
+def _options(prep, unplaced, occupied, forbid):
+    """
+    Legal next moves for the canonical construction, given placed ships.
+    Returns (options, phase) where options is a list of (ship_slot, Placement).
+      * phase 1: some open hit is uncovered -> every (ship, placement) covering
+        the lowest-index uncovered hit.  A move is pruned only when it makes
+        completion impossible (fewer remaining ship squares than uncovered
+        hits), which never removes a legal layout.
+      * phase 2: all hits covered -> the next unplaced ship (fixed order), any
+        placement that avoids `forbid`.
+    """
+    ships = prep.ships
+    uncovered = prep.hit_m & ~occupied
+    if uncovered:
+        h = (uncovered & -uncovered).bit_length() - 1
+        cap = sum(ships[s] for s in unplaced)
+        opts = []
+        for s in unplaced:
+            rest_cap = cap - ships[s]
+            for p in prep.valid_by_cell[ships[s]][h]:
+                if p.mask & forbid:
+                    continue
+                if _popcount(uncovered & ~p.mask) > rest_cap:
+                    continue
+                opts.append((s, p))
+        return opts, 1
+    s = unplaced[0]
+    return [(s, p) for p in prep.valid[ships[s]] if not p.mask & forbid], 2
+
+
+# ---- sequential importance sampling --------------------------------------- #
+def _weighted(prep, n_samples, rng, deadline, max_particles, weighted=True):
+    counts = [0.0] * prep.ncell
+    wsum = wsq = 0.0
+    valid = particles = 0
+    k = len(prep.ships)
+    no_touch = prep.no_touch
+    while valid < n_samples and particles < max_particles:
+        particles += 1
+        if particles % 1024 == 0 and time.time() > deadline:
+            break
+        unplaced = list(range(k))
+        occupied = forbid = 0
+        w = 1.0
+        while unplaced:
+            opts, _ = _options(prep, unplaced, occupied, forbid)
+            if not opts:
+                w = 0.0
+                break
+            w *= len(opts)
+            s, p = opts[rng.randrange(len(opts))]
+            unplaced.remove(s)
+            occupied |= p.mask
+            forbid |= p.halo if no_touch else p.mask
+        if w == 0.0 or prep.hit_m & ~occupied:
+            continue
+        if not weighted:
+            w = 1.0
+        valid += 1
+        wsum += w
+        wsq += w * w
+        for i in _bits(occupied):
+            counts[i] += w
+    ess = (wsum * wsum / wsq) if wsq else 0.0
+    est_total = wsum / particles if particles else 0.0   # unbiased layout count
+    return counts, wsum, valid, particles, ess, est_total
+
+
+# ---- exact enumeration ----------------------------------------------------- #
+class _NodeCap(Exception):
+    pass
+
+
+def _enumerate(prep, node_cap):
+    """Exact per-square layout counts.  Raises _NodeCap if the search is too big."""
+    counts = [0] * prep.ncell
+    nodes = [0]
+    total = [0]
+    no_touch = prep.no_touch
+
+    def dfs(unplaced, occupied, forbid):
+        nodes[0] += 1
+        if nodes[0] > node_cap:
+            raise _NodeCap
+        opts, _ = _options(prep, unplaced, occupied, forbid)
+        if len(unplaced) == 1:
+            # Leaf level: aggregate instead of recursing.
+            good = [p for _, p in opts if not prep.hit_m & ~(occupied | p.mask)]
+            if not good:
+                return
+            n = len(good)
+            total[0] += n
+            for i in _bits(occupied):
+                counts[i] += n
+            for p in good:
+                for i in p.cells:
+                    counts[i] += 1
+            nodes[0] += n
+            return
+        for s, p in opts:
+            rest = [x for x in unplaced if x != s]
+            dfs(rest, occupied | p.mask, forbid | (p.halo if no_touch else p.mask))
+
+    if prep.ships:
+        dfs(list(range(len(prep.ships))), 0, 0)
+    return counts, total[0], nodes[0]
+
+
+# ---- legacy biased sampler (comparison only) ------------------------------- #
+def _sequential_legacy(prep, n_samples, rng, deadline):
+    counts = [0] * prep.ncell
     accepted = attempts = 0
-    t0 = time.time()
-    no_touch = board.no_touch
+    ships, no_touch, hit_m = prep.ships, prep.no_touch, prep.hit_m
     max_attempts = n_samples * 60
-
-    if not ships:
-        return SimResult([0.0] * ncell, counts, 0, 0, 0.0, fit_counts, hit_m == 0)
-
     while accepted < n_samples and attempts < max_attempts:
         attempts += 1
-        if attempts % 2000 == 0 and time.time() - t0 > time_limit:
+        if attempts % 2000 == 0 and time.time() > deadline:
             break
-        occupied = 0          # squares used by ships in this sample
-        forbid = blocked      # squares a new ship may not use
+        occupied = 0
+        forbid = 0
         unplaced = list(range(len(ships)))
         uncovered = hit_m
         ok = True
-
-        # Phase 1 - make sure every open hit is covered by some ship.
         while uncovered:
             h = _random_bit(uncovered, rng)
-            options = []
-            for si in unplaced:
-                for p in valid_by_cell[ships[si]][h]:
-                    if not p.mask & forbid:
-                        options.append((si, p))
+            options = [(si, p) for si in unplaced
+                       for p in prep.valid_by_cell[ships[si]][h] if not p.mask & forbid]
             if not options:
                 ok = False
                 break
@@ -305,12 +523,8 @@ def simulate(board: Board, n_samples: int = 20000, seed=None,
             uncovered &= ~p.mask
         if not ok:
             continue
-
-        # Phase 2 - drop the rest of the fleet at random in open water.
-        # They must avoid open hits too (a hit belongs to exactly one ship and
-        # all hits are already covered), which `forbid` already ensures.
         for si in unplaced:
-            pool = valid[ships[si]]
+            pool = prep.valid[ships[si]]
             if not pool:
                 ok = False
                 break
@@ -325,21 +539,92 @@ def simulate(board: Board, n_samples: int = 20000, seed=None,
             forbid |= p.halo if no_touch else p.mask
         if not ok:
             continue
-
         accepted += 1
-        m = occupied
-        while m:
-            low = m & -m
-            counts[low.bit_length() - 1] += 1
-            m ^= low
+        for i in _bits(occupied):
+            counts[i] += 1
+    return counts, accepted, attempts
 
-    probs = [c / accepted if accepted else 0.0 for c in counts]
-    # known squares are not targets
-    for i, s in enumerate(board.grid):
-        if s != UNKNOWN:
-            probs[i] = 0.0
-    return SimResult(probs, counts, accepted, attempts, time.time() - t0,
-                     fit_counts, accepted > 0)
+
+# ---- public entry point ---------------------------------------------------- #
+def simulate(board: Board, n_samples: int = 20000, seed=None,
+             time_limit: float = 8.0, method: str = "auto",
+             exact_node_cap: int = AUTO_EXACT_NODE_CAP) -> SimResult:
+    """
+    Estimate, for every square, the probability that a remaining ship occupies
+    it, under a uniform distribution over all complete layouts consistent with
+    the board.  See the comment block above for the available methods.
+    """
+    if method not in SAMPLING_METHODS:
+        raise ValueError(f"method must be one of {SAMPLING_METHODS}")
+    rng = random.Random(seed)
+    t0 = time.time()
+    deadline = t0 + time_limit
+    prep = _prepare(board)
+
+    if not prep.ships:
+        # Nothing left to place: consistent iff no open hits remain.
+        return SimResult([0.0] * prep.ncell, [0] * prep.ncell, 0, 0, time.time() - t0,
+                         prep.fit_counts, prep.hit_m == 0, method=method, exact=True,
+                         proven=True, total_layouts=float(prep.hit_m == 0))
+
+    if method == "sequential":
+        counts, acc, att = _sequential_legacy(prep, n_samples, rng, deadline)
+        return _finish(board, prep, counts, acc, att, t0, "sequential")
+
+    if method == "rejection":
+        counts, acc, att = _rejection(prep, n_samples, rng, deadline, n_samples * 2000)
+        return _finish_rejection(board, prep, counts, acc, att, t0)
+
+    if method == "exact":
+        counts, total, nodes = _enumerate(prep, float("inf") if exact_node_cap is None
+                                          else exact_node_cap)
+        return _finish(board, prep, counts, total, nodes, t0, "exact",
+                       exact=True, proven=True, total=total)
+
+    if method == "weighted":
+        return _run_weighted(board, prep, n_samples, rng, deadline, t0)
+
+    # ---- auto -------------------------------------------------------------- #
+    # 1. Pilot rejection run.  Rejection is exact and i.i.d., so keep it
+    #    whenever its projected run time (from the pilot's own speed and
+    #    acceptance rate) fits the budget.
+    counts, acc, att = _rejection(prep, n_samples, rng, deadline,
+                                  min(AUTO_PILOT_PROPOSALS, n_samples * 50))
+    if acc >= n_samples:
+        return _finish_rejection(board, prep, counts, acc, att, t0)
+    if acc:
+        projected = att + (n_samples - acc) * att / acc
+        if projected <= AUTO_REJECTION_PROPOSALS:
+            counts, acc, att = _rejection(prep, n_samples, rng, deadline,
+                                          att + 4 * (n_samples - acc) * att // acc + 1000,
+                                          counts, acc, att)
+            if acc >= n_samples:
+                return _finish_rejection(board, prep, counts, acc, att, t0)
+    # 2. Small layout space -> enumerate exactly (also proves infeasibility).
+    try:
+        counts, total, nodes = _enumerate(prep, exact_node_cap)
+        return _finish(board, prep, counts, total, nodes, t0, "exact",
+                       exact=True, proven=True, total=total)
+    except _NodeCap:
+        pass
+    # 3. Large, constrained space -> weighted importance sampling.
+    return _run_weighted(board, prep, n_samples, rng, deadline, t0)
+
+
+def _finish_rejection(board, prep, counts, acc, att, t0):
+    # Unbiased layout-count estimate: acceptance rate x size of proposal space.
+    space = 1
+    for L in prep.ships:
+        space *= len(prep.valid[L])
+    return _finish(board, prep, counts, acc, att, t0, "rejection",
+                   total=(acc / att * space) if att else 0.0)
+
+
+def _run_weighted(board, prep, n_samples, rng, deadline, t0):
+    counts, wsum, valid, particles, ess, est = _weighted(
+        prep, n_samples, rng, deadline, n_samples * 60)
+    return _finish(board, prep, counts, valid, particles, t0, "weighted",
+                   ess=ess, total=est, weight_sum=wsum)
 
 
 # --------------------------------------------------------------------------- #
@@ -484,34 +769,42 @@ def auto_sink(board: Board, ship_name: str, last_idx=None) -> list:
 # Self-play benchmark (also a handy test)
 # --------------------------------------------------------------------------- #
 def random_layout(size=10, fleet=DEFAULT_FLEET, rng=None, no_touch=False):
+    """
+    A uniformly random legal fleet layout (every complete legal layout is
+    equally likely).  Each ship's placement is drawn independently and the
+    whole fleet is redrawn if any two ships overlap (or touch, under the
+    no-touch rule) - exact rejection sampling, unlike ship-by-ship placement.
+    """
     rng = rng or random.Random()
-    while True:
+    pools = [(name, placements_for(L, size)[0]) for name, L in fleet]
+    for _ in range(1_000_000):
         forbid = 0
         ships = []
-        ok = True
-        for name, L in fleet:
-            allp, _ = placements_for(L, size)
-            for _ in range(200):
-                p = rng.choice(allp)
-                if not p.mask & forbid:
-                    break
-            else:
-                ok = False
+        for name, allp in pools:
+            p = allp[rng.randrange(len(allp))]
+            if p.mask & forbid:
                 break
             forbid |= p.halo if no_touch else p.mask
             ships.append((name, p))
-        if ok:
+        else:
             return ships
+    raise ValueError("Could not place this fleet on the board")
 
 
-def play_game(samples=3000, seed=None, use_parity=True, verbose=False):
+def play_game(samples=3000, seed=None, use_parity=True, verbose=False,
+              method="auto", layout_seed=None):
+    """
+    Self-play one game against a random fleet; returns shots needed.
+    `layout_seed` fixes the enemy layout independently of the shooter's
+    randomness, so different strategies can be compared on identical fleets.
+    """
     rng = random.Random(seed)
-    layout = random_layout(rng=rng)
+    layout = random_layout(rng=random.Random(layout_seed) if layout_seed is not None else rng)
     board = Board()
     hp = {name: set(p.cells) for name, p in layout}
     shots = 0
     while board.remaining_ships():
-        sim = simulate(board, samples, seed=rng.random())
+        sim = simulate(board, samples, seed=rng.random(), method=method)
         rec = recommend(board, sim, use_parity)
         i = rec["best"]
         shots += 1

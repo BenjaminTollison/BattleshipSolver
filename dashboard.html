@@ -249,6 +249,7 @@
             <option value="20000" selected>20,000</option>
             <option value="50000">50,000</option>
             <option value="100000">100,000 (slow)</option>
+            <option value="500000">500,000 (slow)</option>
           </select>
         </label>
         <label>Board
@@ -317,14 +318,22 @@ async function api(path, extra) {
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
 }
+function statusText(r) {
+  const fmt = x => Math.round(x).toLocaleString();
+  if (r.method === "exact")
+    return `Exact: all ${fmt(r.samples)} consistent layouts enumerated in ${r.seconds}s`;
+  if (r.method === "weighted")
+    return `Weighted sampling: ${fmt(r.samples)} layouts (effective sample size ${fmt(r.ess)}) ` +
+           `in ${r.seconds}s`;
+  return `${fmt(r.samples)} uniformly random consistent layouts ` +
+         `(${fmt(r.attempts)} tried, ${r.method}) in ${r.seconds}s`;
+}
 async function analyze() {
   if (busy) { pending = true; return; }
   busy = true; $("status").textContent = "Simulating…";
   try {
     result = await api("/api/analyze");
-    $("status").textContent =
-      `${result.samples.toLocaleString()} random layouts consistent with the board ` +
-      `(${result.attempts.toLocaleString()} tried) in ${result.seconds}s`;
+    $("status").textContent = statusText(result);
   } catch (e) { $("status").textContent = "Error: " + e.message; result = null; }
   busy = false;
   renderBoard(); renderRec();

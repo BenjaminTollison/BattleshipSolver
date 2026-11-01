@@ -38,11 +38,21 @@ python server.py --port 9000 --no-browser
 
 * **Pre-computed placements.** Each legal position of each ship is stored as an
   integer bitmask, so an overlap check is a single `&`.
-* **Monte-Carlo heat map.** Each simulation builds a random layout of the
-  **remaining** ships only. A layout is never allowed to put a ship on a miss or a
-  sunk square, and it must cover every open (un-sunk) hit. Hits are covered first,
-  then the other ships are dropped into open water. The fraction of layouts that use
-  a square is its probability. The default of 20,000 layouts takes about 0.2 s.
+* **Monte-Carlo heat map.** The heat map is the probability that each square
+  holds a ship when **every complete layout of the remaining ships that fits the
+  board is equally likely**. A layout fits if no ship covers a miss or sunk square,
+  ships don't overlap (or touch, under the house rule), and every open hit is
+  covered. `simulate(board, n, method=...)` offers:
+
+  | Method | What it does | Exact? |
+  |---|---|---|
+  | `rejection` | Draw every ship independently, keep the fleet only if it is legal. | Yes, i.i.d. uniform layouts |
+  | `exact` | Enumerate all legal layouts (depth-first search). | Yes, exact probabilities |
+  | `weighted` | Build a layout ship by ship (hits first), weighting it by the number of choices at each step (Knuth's estimator). Fast when there are many hits. | Unbiased weights; ratio estimate converges |
+  | `auto` (default) | Rejection if its projected cost is ≤ 400,000 proposals (about 1.5 s), else exact enumeration if the layout space is small, else weighted. | — |
+  | `sequential` | The previous sampler, kept for comparison only. | **No, biased** |
+
+  The default of 20,000 layouts takes about 0.1–1 s per update on a 10×10 board.
 * **Recommendation.**
   * **TARGET mode** (you have open hits): fire at the highest-probability square.
   * **HUNT mode** (no open hits): checkerboard / parity search. If the smallest ship
@@ -52,24 +62,28 @@ python server.py --port 9000 --no-browser
     class you have already been shooting and takes the best square in it.
   * Squares where no remaining ship can physically fit (because of misses and sunk
     ships around them) are never suggested.
-* **Consistency checks.** The tool warns you if its sampler cannot find a layout
-  fitting the recorded state, or if SUNK squares do not match sunk ships. It will
-  not recommend an arbitrary shot if no consistent layout was sampled. This does
-  not distinguish a mathematically impossible state from sampling exhaustion.
+* **Consistency checks.** The tool warns you if no layout fits the recorded state, or
+  if SUNK squares do not match sunk ships, and it will not recommend a shot then.
+  When `auto` falls back to exact enumeration, "no layout fits" is a proof
+  (`SimResult.proven`); otherwise it may mean the sampler ran out of time.
 
-## Benchmark (self-play, `engine.play_game`)
+## Benchmark
 
-| Strategy | Average shots to sink all 5 ships |
-|---|---|
-| Random firing | ~95 |
-| This tool (1,500 simulations per shot) | ~45 |
+```bash
+python benchmarks/benchmark_sampling.py --out benchmark_report.md
+```
+
+This reports (1) accuracy against exact enumeration, (2) speed and effective sample
+size on 10×10 positions, and (3) shots needed to sink the fleet in paired self-play
+(same enemy fleets for every strategy), comparing unbiased and legacy sampling,
+with and without the checkerboard rule. See `BENCHMARKS.md` for a recorded run.
 
 ## Notes and limits
 
-* Simulations are approximate. Ships are placed one after another rather than drawn
-  perfectly uniformly from all possible layouts. Sequential placement can bias the estimated probabilities relative to a
-  uniform distribution over valid complete layouts. More samples reduce random noise,
-  **not this systematic bias**. See `TESTING.md`.
+* Estimates are random but unbiased: their error shrinks as the sample count grows,
+  and they are validated against exact enumeration in
+  `tests/test_sampling_validity.py`. In `weighted` mode, accuracy is governed by
+  the effective sample size (shown in the dashboard status line), not the raw count.
 * The model assumes your opponent places ships at random. Real people favour some
   patterns, such as avoiding edges or not letting ships touch.
 
@@ -80,4 +94,6 @@ python server.py --port 9000 --no-browser
 * `dashboard.html`: the interactive dashboard
 * `test_engine.py`: original unit tests (`python -m unittest test_engine.py`)
 * `tests/`: expanded pytest suite (`python -m pytest -rx -q`)
-* `TESTING.md`: regression coverage and outstanding probability-calibration issue
+* `TESTING.md`: regression coverage and the sampler validation method
+* `benchmarks/benchmark_sampling.py`: accuracy, speed and self-play benchmark
+* `BENCHMARKS.md`: results of a recorded benchmark run

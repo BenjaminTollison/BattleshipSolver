@@ -133,3 +133,28 @@ def test_http_rejects_out_of_range_ship_and_unknown_grid_state(http_server):
             post_json(http_server + '/api/analyze', payload)
         assert error.value.code == 400
         assert 'error' in json.load(error.value)
+
+
+def test_analyze_reports_sampler_and_accepts_method():
+    payload = {'size': 4, 'fleet': [['A', 2], ['B', 3]], 'samples': 300,
+               'grid': [e.UNKNOWN] * 16, 'method': 'weighted'}
+    payload['grid'][0] = e.HIT
+    response = server.analyze(payload)
+    assert response['method'] == 'weighted'
+    assert 0 < response['ess'] <= 300
+    assert response['exact'] is False and response['total_layouts'] > 0
+    default = server.analyze({**payload, 'method': 'auto'})
+    assert default['method'] in ('rejection', 'exact', 'weighted')
+
+
+def test_analyze_rejects_unknown_method():
+    with pytest.raises(ValueError):
+        server.analyze({'size': 4, 'fleet': [['A', 2]], 'grid': [0] * 16, 'method': 'magic'})
+
+
+def test_analyze_proves_impossible_board():
+    grid = [e.UNKNOWN] * 16
+    grid[0] = grid[15] = e.HIT
+    response = server.analyze({'size': 4, 'fleet': [['A', 2]], 'grid': grid, 'samples': 200})
+    assert not response['consistent'] and response['proven']
+    assert 'checked exhaustively' in response['warnings'][0]

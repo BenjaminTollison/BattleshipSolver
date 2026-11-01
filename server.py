@@ -55,13 +55,20 @@ def board_from(payload) -> engine.Board:
 def analyze(payload):
     board = board_from(payload)
     samples = max(200, min(int(payload.get("samples", 20000)), 200000))
-    sim = engine.simulate(board, samples)
+    method = payload.get("method", "auto")
+    if method not in engine.SAMPLING_METHODS:
+        raise ValueError(f"method must be one of {list(engine.SAMPLING_METHODS)}")
+    sim = engine.simulate(board, samples, method=method)
     rec = engine.recommend(board, sim, use_parity=bool(payload.get("parity", True)))
     warnings = board.warnings()
     if not sim.consistent and board.remaining_ships():
-        warnings.insert(0, "No consistent layout was found by the sampler. "
-                           "Check the board or rerun with more samples; very constrained "
-                           "boards may require additional search.")
+        if sim.proven:
+            warnings.insert(0, "No fleet layout fits this board (checked exhaustively). "
+                               "Look for a mis-entered square or a ship marked sunk by mistake.")
+        else:
+            warnings.insert(0, "No consistent layout was found by the sampler. "
+                               "Check the board or rerun with more samples; very constrained "
+                               "boards may require additional search.")
     return {
         "probs": sim.probs,
         "fits": sim.fit_counts,
@@ -69,6 +76,11 @@ def analyze(payload):
         "attempts": sim.attempts,
         "seconds": round(sim.seconds, 3),
         "consistent": sim.consistent,
+        "method": sim.method,
+        "ess": round(sim.ess, 1),
+        "exact": sim.exact,
+        "proven": sim.proven,
+        "total_layouts": sim.total_layouts,
         "rec": rec,
         "remaining": board.remaining_ships(),
         "warnings": warnings,

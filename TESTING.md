@@ -30,20 +30,37 @@ SciPy, a browser, or external services. HTTP tests bind only to 127.0.0.1.
   *not* exempted from the exclusion halo.
 * Dashboard explicitly displays an INVALID BOARD / NO SHOT recommendation state.
 
-## Remaining expected failure (`xfail(strict=True)`)
+## Sampler validation (formerly the expected failure)
 
-`test_two_ship_posterior_matches_exact_enumeration`: Current Monte Carlo sampling
-chooses placements sequentially and is not uniform over complete legal layouts.
-This creates systematic probability bias that cannot be fixed by increasing the
-sample count. The sampling algorithm should be revised and benchmarked independently.
+`test_two_ship_posterior_matches_exact_enumeration` was `xfail(strict=True)` because
+the sequential sampler was not uniform over complete legal layouts. The default
+sampler (`method="auto"`) now samples uniformly, so the marker has been removed.
+
+`tests/test_sampling_validity.py` checks every method against the independent
+brute-force oracle on 7 small boards: empty, with hits and misses, adjacent and
+scattered hits, no-touch, duplicate ship lengths, and a late-game position.
+
+* `rejection`, `weighted` and `auto`: the maximum error over all squares must be
+  below 4.5 × 0.5/√ESS. That is a conservative standard-error bound, with the
+  effective sample size used for weighted sampling. Across 280 runs with different
+  seeds, the worst result was 2.9 bounds. The legacy sampler misses by 5.6–77 bounds.
+* `exact`: identical to the oracle (to 1e-12), including the number of layouts.
+* Layout-count estimates from `rejection` and `weighted` are within 5% of the exact count.
+* The legacy `sequential` sampler is asserted to *stay* biased as samples grow from
+  5,000 to 40,000. That documents why it is no longer the default.
+* `random_layout` (enemy fleets for self-play) is checked to be uniform with a
+  chi-square test.
 
 ## Scope and limits
 
 * Tiny-board exact enumeration is used as an independent correctness oracle; do not
   try exhaustive enumeration on the standard 10x10 fleet.
 * `test_dashboard_contract.py` is only a static smoke test, not a browser automation test.
-* `engine.SimResult.consistent` means at least one layout was sampled (not a
-  mathematical proof that the board is feasible or infeasible). No sample found may
-  mean contradictory inputs or insufficient search.
+* `engine.SimResult.consistent` means at least one layout was found. When
+  `SimResult.proven` is true (exact enumeration completed), an inconsistent result is
+  a proof that no layout fits. Otherwise no layout may mean contradictory inputs or
+  insufficient search.
+* `SimResult.counts` are integers for `rejection`/`exact`/`sequential`, and
+  ESS-weighted floats (scaled to `samples`) for `weighted`.
 * Displayed `sim.probs` deliberately masks known squares to zero; `counts/samples`
   preserves underlying sampled occupancy, including known unsunk hits.

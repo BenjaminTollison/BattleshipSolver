@@ -128,8 +128,10 @@ def test_random_layout_satisfies_non_overlap_and_no_touch():
             assert occupied.bit_count() == 7
 
 
-@pytest.mark.xfail(strict=True, reason='sampler chooses placements sequentially, biasing full-layout probabilities')
 def test_two_ship_posterior_matches_exact_enumeration():
+    # Formerly xfail(strict=True): the sequential sampler was biased here.
+    # The default sampler is now uniform over complete layouts; see
+    # tests/test_sampling_validity.py for the full statistical validation.
     b = small_board(size=3, fleet=(('Long', 3), ('Short', 2)))
     expected, n_layouts = exact_probabilities(b)
     assert n_layouts == 36
