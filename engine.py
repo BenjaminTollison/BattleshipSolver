@@ -271,6 +271,8 @@ class SimResult:
     exact: bool = False    # probabilities are exact (enumeration)
     proven: bool = False   # `consistent` is a proof (exact enumeration completed)
     total_layouts: float = 0.0   # exact count (exact) or unbiased estimate (weighted)
+    layouts: list = None         # keep_layouts=True: occupancy bitmask of each layout
+    layout_weights: list = None  # matching importance weights (None = all equal)
 
 
 def _random_bit(mask: int, rng: random.Random) -> int:
@@ -336,8 +338,15 @@ def _prepare(board: Board) -> _Prep:
 
 
 def _finish(board, prep, counts, samples, attempts, t0, method, *, ess=None,
-            exact=False, proven=False, total=0.0, weight_sum=None):
+            exact=False, proven=False, total=0.0, weight_sum=None, keep=None):
     """Turn raw occupancy tallies into a SimResult."""
+    layouts = weights = None
+    if keep is not None:
+        if keep and isinstance(keep[0], tuple):
+            layouts = [m for m, _ in keep]
+            weights = [w for _, w in keep]
+        else:
+            layouts = list(keep)
     if weight_sum is not None:                       # weighted tallies
         probs = [c / weight_sum for c in counts] if weight_sum > 0 else [0.0] * prep.ncell
         counts = [p * samples for p in probs]
@@ -349,12 +358,13 @@ def _finish(board, prep, counts, samples, attempts, t0, method, *, ess=None,
     return SimResult(probs, counts, samples, attempts, time.time() - t0,
                      prep.fit_counts, samples > 0, method=method,
                      ess=float(samples if ess is None else ess), exact=exact,
-                     proven=proven, total_layouts=float(total))
+                     proven=proven, total_layouts=float(total),
+                     layouts=layouts, layout_weights=weights)
 
 
 # ---- exact i.i.d. rejection sampling -------------------------------------- #
 def _rejection(prep, n_samples, rng, deadline, max_proposals, counts=None,
-               accepted=0, proposals=0):
+               accepted=0, proposals=0, keep=None):
     """Returns (counts, accepted, proposals).  Can resume a previous run."""
     if counts is None:
         counts = [0] * prep.ncell
@@ -380,6 +390,8 @@ def _rejection(prep, n_samples, rng, deadline, max_proposals, counts=None,
             if hit_m & ~occupied:
                 continue
             accepted += 1
+            if keep is not None:
+                keep.append(occupied)
             for i in _bits(occupied):
                 counts[i] += 1
     return counts, accepted, proposals
@@ -417,7 +429,7 @@ def _options(prep, unplaced, occupied, forbid):
 
 
 # ---- sequential importance sampling --------------------------------------- #
-def _weighted(prep, n_samples, rng, deadline, max_particles, weighted=True):
+def _weighted(prep, n_samples, rng, deadline, max_particles, weighted=True, keep=None):
     counts = [0.0] * prep.ncell
     wsum = wsq = 0.0
     valid = particles = 0
@@ -447,6 +459,8 @@ def _weighted(prep, n_samples, rng, deadline, max_particles, weighted=True):
         valid += 1
         wsum += w
         wsq += w * w
+        if keep is not None:
+            keep.append((occupied, w))
         for i in _bits(occupied):
             counts[i] += w
     ess = (wsum * wsum / wsq) if wsq else 0.0
@@ -459,7 +473,7 @@ class _NodeCap(Exception):
     pass
 
 
-def _enumerate(prep, node_cap):
+def _enumerate(prep, node_cap, keep=None):
     """Exact per-square layout counts.  Raises _NodeCap if the search is too big."""
     counts = [0] * prep.ncell
     nodes = [0]
@@ -481,6 +495,8 @@ def _enumerate(prep, node_cap):
             for i in _bits(occupied):
                 counts[i] += n
             for p in good:
+                if keep is not None:
+                    keep.append(occupied | p.mask)
                 for i in p.cells:
                     counts[i] += 1
             nodes[0] += n
@@ -548,11 +564,16 @@ def _sequential_legacy(prep, n_samples, rng, deadline):
 # ---- public entry point ---------------------------------------------------- #
 def simulate(board: Board, n_samples: int = 20000, seed=None,
              time_limit: float = 8.0, method: str = "auto",
-             exact_node_cap: int = AUTO_EXACT_NODE_CAP) -> SimResult:
+             exact_node_cap: int = AUTO_EXACT_NODE_CAP,
+             keep_layouts: bool = False) -> SimResult:
     """
     Estimate, for every square, the probability that a remaining ship occupies
     it, under a uniform distribution over all complete layouts consistent with
     the board.  See the comment block above for the available methods.
+
+    keep_layouts=True also returns every sampled/enumerated layout as a bitmask
+    (`SimResult.layouts`, with `layout_weights` for weighted sampling), which
+    lets strategies condition on hypothetical shot outcomes (lookahead).
     """
     if method not in SAMPLING_METHODS:
         raise ValueError(f"method must be one of {SAMPLING_METHODS}")
@@ -560,6 +581,7 @@ def simulate(board: Board, n_samples: int = 20000, seed=None,
     t0 = time.time()
     deadline = t0 + time_limit
     prep = _prepare(board)
+    keep = [] if keep_layouts else None
 
     if not prep.ships:
         # Nothing left to place: consistent iff no open hits remain.
@@ -572,59 +594,62 @@ def simulate(board: Board, n_samples: int = 20000, seed=None,
         return _finish(board, prep, counts, acc, att, t0, "sequential")
 
     if method == "rejection":
-        counts, acc, att = _rejection(prep, n_samples, rng, deadline, n_samples * 2000)
-        return _finish_rejection(board, prep, counts, acc, att, t0)
+        counts, acc, att = _rejection(prep, n_samples, rng, deadline, n_samples * 2000,
+                                      keep=keep)
+        return _finish_rejection(board, prep, counts, acc, att, t0, keep)
 
     if method == "exact":
         counts, total, nodes = _enumerate(prep, float("inf") if exact_node_cap is None
-                                          else exact_node_cap)
+                                          else exact_node_cap, keep)
         return _finish(board, prep, counts, total, nodes, t0, "exact",
-                       exact=True, proven=True, total=total)
+                       exact=True, proven=True, total=total, keep=keep)
 
     if method == "weighted":
-        return _run_weighted(board, prep, n_samples, rng, deadline, t0)
+        return _run_weighted(board, prep, n_samples, rng, deadline, t0, keep)
 
     # ---- auto -------------------------------------------------------------- #
     # 1. Pilot rejection run.  Rejection is exact and i.i.d., so keep it
     #    whenever its projected run time (from the pilot's own speed and
     #    acceptance rate) fits the budget.
     counts, acc, att = _rejection(prep, n_samples, rng, deadline,
-                                  min(AUTO_PILOT_PROPOSALS, n_samples * 50))
+                                  min(AUTO_PILOT_PROPOSALS, n_samples * 50), keep=keep)
     if acc >= n_samples:
-        return _finish_rejection(board, prep, counts, acc, att, t0)
+        return _finish_rejection(board, prep, counts, acc, att, t0, keep)
     if acc:
         projected = att + (n_samples - acc) * att / acc
         if projected <= AUTO_REJECTION_PROPOSALS:
             counts, acc, att = _rejection(prep, n_samples, rng, deadline,
                                           att + 4 * (n_samples - acc) * att // acc + 1000,
-                                          counts, acc, att)
+                                          counts, acc, att, keep=keep)
             if acc >= n_samples:
-                return _finish_rejection(board, prep, counts, acc, att, t0)
+                return _finish_rejection(board, prep, counts, acc, att, t0, keep)
     # 2. Small layout space -> enumerate exactly (also proves infeasibility).
     try:
-        counts, total, nodes = _enumerate(prep, exact_node_cap)
+        keep = [] if keep_layouts else None
+        counts, total, nodes = _enumerate(prep, exact_node_cap, keep)
         return _finish(board, prep, counts, total, nodes, t0, "exact",
-                       exact=True, proven=True, total=total)
+                       exact=True, proven=True, total=total, keep=keep)
     except _NodeCap:
         pass
     # 3. Large, constrained space -> weighted importance sampling.
-    return _run_weighted(board, prep, n_samples, rng, deadline, t0)
+    keep = [] if keep_layouts else None
+    return _run_weighted(board, prep, n_samples, rng, deadline, t0, keep)
 
 
-def _finish_rejection(board, prep, counts, acc, att, t0):
+def _finish_rejection(board, prep, counts, acc, att, t0, keep=None):
     # Unbiased layout-count estimate: acceptance rate x size of proposal space.
     space = 1
     for L in prep.ships:
         space *= len(prep.valid[L])
     return _finish(board, prep, counts, acc, att, t0, "rejection",
-                   total=(acc / att * space) if att else 0.0)
+                   total=(acc / att * space) if att else 0.0, keep=keep)
 
 
-def _run_weighted(board, prep, n_samples, rng, deadline, t0):
+def _run_weighted(board, prep, n_samples, rng, deadline, t0, keep=None):
     counts, wsum, valid, particles, ess, est = _weighted(
-        prep, n_samples, rng, deadline, n_samples * 60)
+        prep, n_samples, rng, deadline, n_samples * 60, keep=keep)
     return _finish(board, prep, counts, valid, particles, t0, "weighted",
-                   ess=ess, total=est, weight_sum=wsum)
+                   ess=ess, total=est, weight_sum=wsum, keep=keep)
 
 
 # --------------------------------------------------------------------------- #

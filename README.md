@@ -97,3 +97,6 @@ with and without the checkerboard rule. See `BENCHMARKS.md` for a recorded run.
 * `TESTING.md`: regression coverage and the sampler validation method
 * `benchmarks/benchmark_sampling.py`: accuracy, speed and self-play benchmark
 * `BENCHMARKS.md`: results of a recorded benchmark run
+* `strategies.py`: control strategy + experimental shot-selection strategies and the
+  paired self-play harness (see `STRATEGIES.md`)
+* `benchmarks/benchmark_strategies.py`: paired strategy benchmark with acceptance criteria

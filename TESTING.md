@@ -64,3 +64,18 @@ scattered hits, no-touch, duplicate ship lengths, and a late-game position.
   ESS-weighted floats (scaled to `samples`) for `weighted`.
 * Displayed `sim.probs` deliberately masks known squares to zero; `counts/samples`
   preserves underlying sampled occupancy, including known unsunk hits.
+
+## Strategy experiments (`tests/test_strategies.py`)
+
+* The control replays `engine.play_game` exactly. This guarantees the strategy
+  benchmark's control matches `benchmark_1600.md`.
+* Adaptive checkerboard: it leaves the grid only beyond `margin`; `margin=∞` gives
+  the control and a negative margin gives greedy. Target mode is unchanged.
+* Lookahead: the 2-shot expected-hits value matches brute force on a small board;
+  depth 1 is greedy; hunting is identical to the control.
+* Adaptive Monte Carlo: the expected-loss formula is checked, the standard error of
+  the gap matches the direct formula, pooled samples stay unbiased (for both
+  rejection and weighted sampling), it draws no extra samples for exact or clear
+  decisions, and it samples up to the cap on close calls.
+* Harness: strategy names with parameters are validated, games are deterministic,
+  and the report's paired differences are checked.
